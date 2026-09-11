@@ -1,0 +1,436 @@
+---
+title: "Whitney Henry - scRNAseq Analysis - CZ CELLxGENE Atlas - Malignant Pseudobulk ssGSEA/GSVA/UCell Figures"
+author: "Charlie Whittaker"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "8/31/2026"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(1234)
+```
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(openxlsx)
+library(ggpubr)
+library(Seurat)
+library(GSVA)
+library(UCell)
+library(ComplexHeatmap)
+```
+
+# Goal
+
+This is the decided-on figure set for the malignant pseudobulk data:
+gene-set scores by `EMT_KS_TumorSig` tertile, as box plots with statistics,
+for all three scoring methods on `pseudobulk` -- ssGSEA, GSVA, and UCell --
+plus a single ssGSEA summary heatmap. EMT itself is scored with the KS
+method only (MLR is not used in this notebook); samples are stratified
+into low/mid/high tertiles of that KS score.
+
+It starts from `Atlas_malignant_pseudobulk_donor.rds`, produced by
+`ChenAtlas_malignant_pseudobulk_prep.Rmd`. That checkpoint carries only
+the per-donor expression matrix and donor metadata -- no score columns --
+so this notebook is fully self-contained.
+
+# Load pseudobulk object
+
+```{r load-pseudobulk}
+pseudobulk <- readRDS("Atlas_malignant_pseudobulk_donor.rds")
+pseudobulk
+```
+
+# EMT KS scoring
+
+`Atlas_malignant_pseudobulk_donor.rds` carries only the per-donor
+expression matrix and donor metadata -- `EMT_KS_TumorSig` itself is
+computed here using the `KSScore()` method to run a per-donor, two-sample
+Kolmogorov-Smirnov test comparing each donor's own expression across the
+tumor-calibrated `Mes.tum` genes against its own expression across the
+`Epi.tum` genes.
+
+```{r ks-source}
+source("../emt_code/Chakraborty_et_al_KS_code_vCAW.R")
+KSScore.EMTSignature.file <- "../emt_code/EM_gene_signature_tumor_KS.xlsx"
+
+emt.tumor.ks <- read.xlsx("../emt_code/EM_gene_signature_tumor_KS.xlsx", colNames = FALSE)
+emt.tumor.ks <- emt.tumor.ks %>% dplyr::rename(gene = X1, group = X2)
+Epi.tum.ks <- emt.tumor.ks$gene[emt.tumor.ks$group == "Epi"]
+Mes.tum.ks <- emt.tumor.ks$gene[emt.tumor.ks$group == "Mes"]
+```
+
+```{r ks-tumor-pseudobulk}
+emt_genes_ks <- unique(c(Epi.tum.ks, Mes.tum.ks))
+
+expr_matrix_ks <- GetAssayData(pseudobulk, assay = "RNA", layer = "data")
+expr_matrix_ks <- expr_matrix_ks[rownames(expr_matrix_ks) %in% emt_genes_ks, ]
+expr_matrix_ks <- as.matrix(expr_matrix_ks)
+dim(expr_matrix_ks)
+
+ks_tumor_pb <- suppressWarnings(KSScore(expr_matrix_ks, "tumorSig_AtlasMalignantPseudobulk", "."))
+pseudobulk$EMT_KS_TumorSig <- ks_tumor_pb[colnames(pseudobulk)]
+```
+
+# KS score tertiles
+
+Same tertile logic used across the companion bulk/pseudobulk notebooks
+(bottom/middle/top third of `EMT_KS_TumorSig`), applied to the
+`EMT_KS_TumorSig` score just computed above.
+
+```{r ks-tertile-fn}
+.ksTertileGroup <- function(x) {
+  ks_tertiles <- quantile(x, probs = c(1/3, 2/3), na.rm = TRUE)
+  cut(x, breaks = c(-Inf, ks_tertiles[1], ks_tertiles[2], Inf),
+      labels = c("KS_low", "KS_mid", "KS_high"))
+}
+
+pseudobulk$KS_Group <- .ksTertileGroup(pseudobulk$EMT_KS_TumorSig)
+
+table(pseudobulk$KS_Group)
+```
+
+# Score gene sets with GSVA, ssGSEA, and UCell
+
+`Atlas_04` already scored `pseudobulk` with GSVA and ssGSEA; all three
+methods are (re-)scored here instead, on the exact same 9-gene-set list --
+GSVA/ssGSEA reuse `Atlas_04`'s own `gsvaParam()`/`ssgseaParam()` calls
+verbatim (this overwrites the `_GSVA`/`_ssGSEA` columns already on
+`pseudobulk` -- expected, since the input matrix and gene sets haven't
+changed) and UCell is scored fresh, since `Atlas_04` doesn't compute it.
+The pathway/KS-signature gene sets are rebuilt here -- identical
+definitions to `Atlas_04`'s own `pathways_to_score`.
+
+```{r ucell-gene-sets}
+# BH4 synthesis and recycling
+BH4 <- c("DHFR", "GCH1", "PCBD1", "PCBD2", "PTS", "QDPR", "SPR")
+
+# De novo BH4 synthesis only
+BH4.synth <- c("GCH1", "PTS", "SPR")
+
+# BH4 recycling and regeneration only
+BH4.recyc <- c("QDPR", "DHFR", "PCBD1", "PCBD2")
+
+# Cystine uptake and GSH synthesis/recycling
+Glutathione <- c("SLC7A11", "SLC3A2", "GCLC", "GCLM", "GSS", "GSR")
+
+# CoQ/Ubiquinol biosynthesis
+CoQ10 <- c("COQ2", "COQ3", "COQ4", "COQ5", "COQ6", "COQ7",
+            "COQ8A", "COQ8B", "COQ9", "HPDL", "PDSS1", "PDSS2", "STARD7")
+
+# Thioredoxin system
+Thioredoxin <- c("TXN", "TXNRD1", "TXN2", "TXNRD2")
+
+# Canonical peroxiredoxins
+Peroxiredoxin <- c("PRDX1", "PRDX2", "PRDX3", "PRDX4", "PRDX5")
+
+emt.tumor <- read.xlsx("../emt_code/EM_gene_signature_tumor_KS.xlsx", colNames = FALSE)
+emt.tumor <- emt.tumor %>% dplyr::rename(gene = X1, group = X2)
+Epi.tum <- emt.tumor$gene[emt.tumor$group == "Epi"]
+Mes.tum <- emt.tumor$gene[emt.tumor$group == "Mes"]
+
+pathways_to_score <- list(
+  BH4           = BH4,
+  BH4.synth     = BH4.synth,
+  BH4.recyc     = BH4.recyc,
+  Glutathione   = Glutathione,
+  CoQ10         = CoQ10,
+  Thioredoxin   = Thioredoxin,
+  Peroxiredoxin = Peroxiredoxin,
+  Epi.tum       = Epi.tum,
+  Mes.tum       = Mes.tum)
+```
+
+## GSVA
+
+Same call as `Atlas_04`'s `gsva-pseudobulk`/`store-gsva-scores` chunks --
+no `kcdf = "none"` override here (unlike the bulk RNA-seq notebooks), to
+match `Atlas_04` exactly.
+
+```{r gsva-pseudobulk}
+expr_matrix_pb <- as.matrix(GetAssayData(pseudobulk, assay = "RNA", layer = "data"))
+dim(expr_matrix_pb)
+
+gsva_param  <- gsvaParam(expr_matrix_pb, pathways_to_score)
+gsva_scores <- gsva(gsva_param)
+dim(gsva_scores)  # expect 9 gene sets x ncol(pseudobulk)
+
+gsva_scores_df <- as.data.frame(t(gsva_scores))
+colnames(gsva_scores_df) <- paste0(colnames(gsva_scores_df), "_GSVA")
+
+pseudobulk <- AddMetaData(pseudobulk, gsva_scores_df)
+```
+
+## ssGSEA
+
+Same call as `Atlas_04`'s `ssgsea-pseudobulk`/`store-ssgsea-scores`
+chunks. Reuses `expr_matrix_pb` and `pathways_to_score` from the GSVA step
+above.
+
+```{r ssgsea-pseudobulk}
+ssgsea_param  <- ssgseaParam(expr_matrix_pb, pathways_to_score, normalize = TRUE)
+ssgsea_scores <- gsva(ssgsea_param)
+dim(ssgsea_scores)  # expect 9 gene sets x ncol(pseudobulk)
+
+ssgsea_scores_df <- as.data.frame(t(ssgsea_scores))
+colnames(ssgsea_scores_df) <- paste0(colnames(ssgsea_scores_df), "_ssGSEA")
+
+pseudobulk <- AddMetaData(pseudobulk, ssgsea_scores_df)
+```
+
+## UCell
+
+```{r ucell-pseudobulk}
+pseudobulk <- UCell::AddModuleScore_UCell(
+  pseudobulk, features = pathways_to_score, maxRank = 10000,
+  slot = "data", name = "_UCell"
+)
+
+ucell_cols_pb <- grep("_UCell$", colnames(pseudobulk@meta.data), value = TRUE)
+ucell_cols_pb
+```
+
+# Gene sets scored
+
+Pulled directly from the `_ssGSEA` columns the scoring section above
+attached to `pseudobulk`'s metadata, rather than re-deriving the list from
+`pathways_to_score` -- confirms the actual scored columns, not just the
+gene sets that were requested.
+
+`_GSVA` and `_UCell` are expected to cover the exact same set of gene sets
+(all three were scored from the same `pathways_to_score` above) -- checked
+explicitly below rather than assumed, so a mismatched gene-set list fails
+loudly here instead of silently producing empty/partial plots further
+down.
+
+```{r scored-gene-sets}
+ssgsea_cols <- grep("_ssGSEA$", colnames(pseudobulk@meta.data), value = TRUE)
+gsva_cols   <- grep("_GSVA$",   colnames(pseudobulk@meta.data), value = TRUE)
+ucell_cols  <- grep("_UCell$",  colnames(pseudobulk@meta.data), value = TRUE)
+
+all_scored_gene_sets <- sub("_ssGSEA$", "", ssgsea_cols)
+
+stopifnot(
+  "GSVA-scored gene sets don't match ssGSEA's -- check the GSVA scoring chunk above" =
+    setequal(all_scored_gene_sets, sub("_GSVA$", "", gsva_cols)),
+  "UCell-scored gene sets don't match ssGSEA's -- check the UCell scoring chunk above" =
+    setequal(all_scored_gene_sets, sub("_UCell$", "", ucell_cols))
+)
+
+all_scored_gene_sets
+```
+
+# Box plots by KS tertile, one section per scoring method
+
+## Shared helpers
+
+`.tightBoxYlim()` computes each KS tertile's own boxplot whisker range
+(`boxplot.stats()`, the same lower/upper-whisker definition `geom_boxplot()`
+uses) and takes the min/max across the three tertiles, then
+`coord_cartesian()` zooms to exactly that -- tight to the boxes themselves,
+not stretched by outlier donors that aren't even drawn.
+`.pairwiseTests()` runs all pairwise Wilcoxon tests among `KS_Group`'s
+levels, BH-adjusted for the 3 comparisons, and returns every pair tagged
+`significant` (p.adj < 0.05) with the BH-adjusted p-value itself shown as
+the label (not significance stars) -- both significant and
+non-significant pairs are shown on the plot.
+
+```{r boxplot-helper-fns}
+.tightBoxYlim <- function(df, y_col, group_col) {
+  group_ranges <- tapply(df[[y_col]], df[[group_col]], function(y) {
+    range(boxplot.stats(y)$stats)
+  })
+  c(min(sapply(group_ranges, min)), max(sapply(group_ranges, max)))
+}
+
+.pairwiseTests <- function(df, y_col, group_col, min_n = 2) {
+  groups <- levels(df[[group_col]])
+  pairs  <- utils::combn(groups, 2, simplify = FALSE)
+
+  res <- purrr::map_dfr(pairs, function(pr) {
+    x <- df[[y_col]][df[[group_col]] == pr[1]]
+    y <- df[[y_col]][df[[group_col]] == pr[2]]
+    if (length(x) < min_n || length(y) < min_n) return(tibble())
+    tibble(group1 = pr[1], group2 = pr[2], p = wilcox.test(x, y)$p.value)
+  })
+
+  if (nrow(res) == 0) return(res)
+
+  res$p.adj       <- p.adjust(res$p, method = "BH")
+  res$significant <- res$p.adj < 0.05
+  res$p.label     <- paste0("p = ", formatC(res$p.adj, format = "g", digits = 2))
+  res
+}
+```
+
+## Single-panel plotting function
+
+One panel per gene set: box plot by `KS_Group` and all-pairwise Wilcoxon
+brackets (black, BH-adjusted p-value labels). No omnibus Kruskal-Wallis annotation --
+dropped for consistency with `TCGA_BRCA_EMT_GeneSet_Scoring.Rmd`/
+`TCGA_EMT_GeneSet_Scoring.Rmd`: it isn't gating anything here (the brackets
+render regardless of its result), and the BH-adjusted pairwise comparisons
+are the more specific, more informative answer to "which tertiles differ"
+that these panels are actually being used for.
+
+```{r genesetscore-single-panel-fn}
+.geneSetSinglePanelByKS <- function(object, gene_set, suffix, method_label,
+                                     add_pairwise_brackets = TRUE) {
+  score_col <- paste0(gene_set, suffix)
+
+  df <- FetchData(object, vars = c(score_col, "KS_Group"))
+  colnames(df)[colnames(df) == score_col] <- "Score"
+
+  ylim_vals <- .tightBoxYlim(df, "Score", "KS_Group")
+
+  pairwise <- NULL
+  if (add_pairwise_brackets) {
+    pairwise <- .pairwiseTests(df, "Score", "KS_Group")
+    if (nrow(pairwise) > 0) {
+      step <- 0.12 * diff(ylim_vals)
+      pairwise$y.position <- ylim_vals[2] + seq_len(nrow(pairwise)) * step
+      ylim_vals[2] <- max(pairwise$y.position) + step * 0.5
+    }
+  }
+
+  group_n <- table(df$KS_Group)
+
+  p <- ggplot(df, aes(x = KS_Group, y = Score, fill = KS_Group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.8, linewidth = 0.7) +
+    coord_cartesian(ylim = ylim_vals) +
+    theme_bw() +
+    theme(
+      panel.grid   = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+      plot.title   = element_text(face = "bold", size = 13, hjust = 0.5),
+      axis.title   = element_text(face = "bold", size = 13),
+      axis.text    = element_text(face = "bold", size = 11)
+    ) +
+    NoLegend() +
+    scale_x_discrete(labels = function(l) paste0(l, "\n(n=", group_n[l], ")")) +
+    labs(x = NULL, y = paste0(method_label, " score"),
+         title = paste0(gene_set, " (", method_label, ")"))
+
+  if (add_pairwise_brackets && !is.null(pairwise) && nrow(pairwise) > 0) {
+    p <- p + ggpubr::stat_pvalue_manual(
+      pairwise, label = "p.label", tip.length = 0.01,
+      color = "black", fontface = "bold", bracket.size = 0.6
+    )
+  }
+
+  p
+}
+```
+
+## ssGSEA: one box plot per gene set
+
+Only the 5 gene sets below are saved to `figures/` -- these are the
+specifically-named SVGs pulled into the paper; every other gene set is
+printed inline only, nothing else is written to disk.
+
+```{r geneset-boxplot-ksgroup-ssgsea, fig.width=4, fig.height=3}
+required_svg_figures <- c(
+  BH4           = "figures/Fig5b_ssgsea_BH4_Chen.svg",
+  Glutathione   = "figures/ExtData5a_ssgsea_Glutathione_Chen.svg",
+  CoQ10         = "figures/ExtData5b_ssgsea_CoQ10_Chen.svg",
+  Thioredoxin   = "figures/ExtData5c_ssgsea_Thioredoxin_Chen.svg",
+  Peroxiredoxin = "figures/ExtData5d_ssgsea_Peroxiredoxin_Chen.svg"
+)
+
+for (gs in all_scored_gene_sets) {
+  p <- .geneSetSinglePanelByKS(pseudobulk, gs, "_ssGSEA", "ssGSEA")
+
+  if (gs %in% names(required_svg_figures)) {
+    ggsave(required_svg_figures[[gs]], plot = p, width = 4, height = 3)
+  }
+
+  print(p)
+}
+```
+
+## GSVA: one box plot per gene set
+
+Same `.geneSetSinglePanelByKS()` call as ssGSEA above, just pointed at the
+`_GSVA` columns scored above -- same tight-whisker y-axis and BH-adjusted
+pairwise Wilcoxon brackets, one panel per gene set.
+Printed inline only -- none of the requested figures are GSVA-based, so
+nothing here is saved to `figures/`.
+
+```{r geneset-boxplot-ksgroup-gsva, fig.width=4, fig.height=3}
+for (gs in all_scored_gene_sets) {
+  p <- .geneSetSinglePanelByKS(pseudobulk, gs, "_GSVA", "GSVA")
+
+  print(p)
+}
+```
+
+## UCell: one box plot per gene set
+
+Same again, pointed at the `_UCell` columns scored above (directly on
+`pseudobulk`, `maxRank = 10000`). Printed inline only, nothing saved to
+`figures/`.
+
+```{r geneset-boxplot-ksgroup-ucell, fig.width=4, fig.height=3}
+for (gs in all_scored_gene_sets) {
+  p <- .geneSetSinglePanelByKS(pseudobulk, gs, "_UCell", "UCell")
+
+  print(p)
+}
+```
+
+# Heatmap: ssGSEA scores across donors, ordered by KS score
+
+Donors ordered by `EMT_KS_TumorSig` (Epi -> Mes), with the KS score itself
+shown as a top color bar. Rows are the 7 curated gene-set scores (`BH4.synth`/
+`BH4.recyc`, subsets of `BH4`'s own genes, are excluded here), each z-scored
+across donors since the gene sets aren't on a shared scale to begin with.
+
+```{r genesetscore-heatmap-fn}
+.geneSetScoreHeatmap <- function(object, suffix, title) {
+  score_set_order <- c("Epi.tum", "Mes.tum", "BH4",
+                        "Glutathione", "CoQ10", "Thioredoxin", "Peroxiredoxin")
+  score_cols_hm <- paste0(score_set_order, suffix)
+
+  ks_order  <- order(object@meta.data$EMT_KS_TumorSig)
+  ks_values <- object@meta.data$EMT_KS_TumorSig[ks_order]
+
+  score_mat <- t(as.matrix(FetchData(object, vars = score_cols_hm)))
+  score_mat <- score_mat[, ks_order]
+  rownames(score_mat) <- sub(suffix, "", rownames(score_mat))
+
+  combined_scaled <- t(scale(t(score_mat)))
+
+  ks_cols <- circlize::colorRamp2(c(min(ks_values), max(ks_values)), c("darkorange", "lightgreen"))
+
+  col_anno <- HeatmapAnnotation(
+    EMT_KS_TumorSig = ks_values,
+    col = list(EMT_KS_TumorSig = ks_cols)
+    )
+
+  Heatmap(combined_scaled,
+          name              = "z-score",
+          top_annotation    = col_anno,
+          cluster_columns   = FALSE,
+          cluster_rows      = FALSE,
+          show_column_names = FALSE,
+          column_title      = paste0(title, ", ordered by EMT_KS_TumorSig (Epi -> Mes)"),
+          row_title         = "Gene set score")
+}
+```
+
+```{r pb-heatmap-ssgsea, fig.width=13, fig.height=6}
+.geneSetScoreHeatmap(pseudobulk, "_ssGSEA", "Pseudobulk (ssGSEA)")
+```
+
+# write session info
+
+Capturing information about the R session helps document your work
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "ChenAtlas_pseudobulk_figures_sessionInfo.txt")
+```

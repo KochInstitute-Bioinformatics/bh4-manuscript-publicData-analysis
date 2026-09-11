@@ -1,0 +1,213 @@
+---
+title: "Whitney Henry - scRNAseq Analysis - CZ CELLxGENE Atlas - Malignant Pseudobulk Prep"
+author: "Charlie Whittaker"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/10/2026"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 5e10)
+set.seed(1234)
+```
+
+# Goal
+This workflow does not need to be run but instead documents the preparation of the necessary pseudobulk object.
+
+`ChenAtlas_malignant_pseudobulk.Rmd` starts from `Atlas_malignant_pseudobulk_donor.rds`
+and only actually needs one thing from it: the per-donor expression matrix
+(plus donor metadata) -- it computes `EMT_KS_TumorSig` (used for `KS_Group`
+tertiles) and recomputes GSVA/ssGSEA/UCell itself, all directly in that
+notebook.
+
+This notebook is a single, lightweight run that regenerates exactly that
+object.
+
+The source h5ad is downloaded on demand into `data/` (see below) rather
+than assumed to already be there, so this notebook is runnable from a clean
+checkout with nothing but the CZ CELLxGENE URL.
+
+Nothing is checkpointed to disk along the way -- the ~621K-cell full atlas
+and the malignant-only subset (multi-GB Seurat objects in the original
+pipeline) exist only in this session's memory and are dropped (`rm()`/`gc()`)
+once no longer needed. Only the final donor-level pseudobulk object (tens of
+MB) is written out. The tradeoff: there's no restart checkpoint, so a crash
+partway through means re-running from the top, including the full h5ad
+import and gene-symbol resolution over ~621K cells.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+library(anndataR)
+```
+
+# Import h5ad and resolve to gene-symbol-keyed Seurat object
+
+Same source atlas, layer-naming fix, and Ensembl->symbol resolution. The max-per-gene (MPG) approach is 
+used to resolve genes that share a symbol.
+
+```{r data-paths}
+h5ad_url  <- "https://datasets.cellxgene.cziscience.com/0fbf6fa3-8463-46ab-bda8-9703848b58db.h5ad"
+h5ad_file <- "data/0fbf6fa3-8463-46ab-bda8-9703848b58db.h5ad"
+```
+
+Downloads the source atlas into `data/` if it isn't already there (this
+is a ~1-2GB file)
+
+```{r download-h5ad}
+dir.create(dirname(h5ad_file), recursive = TRUE, showWarnings = FALSE)
+if (!file.exists(h5ad_file)) {
+  download.file(h5ad_url, destfile = h5ad_file, mode = "wb")
+}
+```
+
+```{r import-h5ad}
+seu <- read_h5ad(h5ad_file, as = "Seurat")
+seu
+```
+
+```{r rename-X-layer}
+# `X` is log-normalized data (confirmed in Atlas_01_import.Rmd), not raw
+# counts -- belongs in Seurat's `data` slot, not `counts`.
+seu[["RNA"]]$data <- seu[["RNA"]]$X
+seu[["RNA"]]$X <- NULL
+```
+
+```{r source-mpg-tool}
+source("../Rcode/data_formatting_tools.R")
+```
+
+```{r compute-gene-mpg}
+adata <- read_h5ad(h5ad_file)  # default `as`, for the var/feature_name table
+
+mat <- GetAssayData(seu, assay = "RNA", layer = "data")
+matched_var <- adata$var[match(rownames(mat), rownames(adata$var)), ]
+
+mpg_table <- data.frame(
+  ensembl_id   = rownames(mat),
+  feature_name = as.character(matched_var$feature_name),
+  Avg          = Matrix::rowMeans(mat),
+  Var          = Matrix::rowMeans(mat^2) - Matrix::rowMeans(mat)^2,
+  stringsAsFactors = FALSE
+)
+
+mpg_table <- calculate_MPG(mpg_table, gene_col = "feature_name", avg_col = "Avg", var_col = "Var")
+rm(adata, mat)
+```
+
+```{r rename-features-to-symbol}
+mat_mpg <- GetAssayData(seu, assay = "RNA", layer = "data")
+mat_mpg <- mat_mpg[mpg_table$MPG == "Yes", ]
+rownames(mat_mpg) <- mpg_table$feature_name[mpg_table$MPG == "Yes"]
+
+seu[["RNA"]] <- CreateAssay5Object(data = mat_mpg)
+rm(mat_mpg, mpg_table)
+
+dim(seu)  # one row per unique gene symbol now, not one per Ensembl ID
+```
+
+No further cell filtering is applied here (no mito/QC metrics ship with this
+export, and none of the 8 batches stood out on `nCount_RNA`/`nFeature_RNA` --
+see `Atlas_01_import.Rmd`'s QC section for that check) -- proceeds on the
+full imported object as-is.
+
+# Subset to malignant cells
+
+```{r subset-malignant}
+DefaultAssay(seu) <- "RNA"
+malignant <- subset(seu, subset = cell_type == "malignant cell")
+malignant
+
+rm(seu)
+gc()
+```
+
+# Aggregate to donor-level pseudobulk (malignant cells only)
+
+`AverageExpression()`, not `AggregateExpression()`, since this atlas has no
+raw counts anywhere to sum -- it un-logs each log-normalized value, means
+within donor, then re-logs (see `Atlas_02_allcells_pseudobulk.Rmd`/`Atlas_04`
+for the full reasoning). `data` from this call is already properly
+re-logged, so no further `NormalizeData()` step is needed.
+
+```{r aggregate-pseudobulk}
+pseudobulk <- AverageExpression(
+  malignant,
+  assays        = "RNA",
+  layer         = "data",
+  group.by      = "donor_id",
+  return.seurat = TRUE
+)
+# if `layer` isn't accepted for this Seurat/AverageExpression version, use:
+# slot = "data" instead
+
+pseudobulk
+```
+
+## Reattach donor-level clinical metadata
+
+`AverageExpression()` sanitizes `donor_id` into column names (`_` -> `-`),
+so the join below matches on the sanitized form and verifies that recovers
+every column before trusting it -- same fix as `Atlas_02`/`Atlas_04`. `assay`
+is excluded: it's a per-library technical detail (donor `BC397_Tumor` has
+cells under two different chemistries), not a stable per-donor field.
+
+```{r reattach-metadata}
+donor_meta <- malignant@meta.data %>%
+  dplyr::distinct(donor_id, batch, disease, tissue, sex,
+                   self_reported_ethnicity, development_stage, grade)
+
+stopifnot(!any(duplicated(donor_meta$donor_id)))
+
+rownames(donor_meta) <- gsub("_", "-", donor_meta$donor_id)
+stopifnot(all(colnames(pseudobulk) %in% rownames(donor_meta)))
+
+donor_meta_ordered <- donor_meta[colnames(pseudobulk), ]
+
+pseudobulk$donor_id <- donor_meta_ordered$donor_id
+pseudobulk@meta.data <- cbind(
+  pseudobulk@meta.data,
+  donor_meta_ordered[, setdiff(colnames(donor_meta_ordered), "donor_id")]
+)
+```
+
+## Add malignant cell counts per donor
+
+```{r add-donor-counts}
+donor_counts <- table(malignant$donor_id)
+donor_counts_df <- as.data.frame(donor_counts, stringsAsFactors = FALSE)
+colnames(donor_counts_df) <- c("donor_id", "n_malignant_cells")
+
+rownames(donor_counts_df) <- gsub("_", "-", donor_counts_df$donor_id)
+stopifnot(all(colnames(pseudobulk) %in% rownames(donor_counts_df)))
+
+pseudobulk$n_malignant_cells <- donor_counts_df[colnames(pseudobulk), "n_malignant_cells"]
+
+pseudobulk@meta.data
+
+rm(malignant)
+gc()
+```
+
+# Save pseudobulk object
+
+No EMT/KS scoring is done here -- `ChenAtlas_malignant_pseudobulk.Rmd` now
+computes `EMT_KS_TumorSig` itself directly from this object's expression
+matrix, so this checkpoint carries only the aggregated expression matrix
+and donor metadata/counts from the sections above.
+
+```{r save-pseudobulk}
+saveRDS(pseudobulk, "Atlas_malignant_pseudobulk_donor.rds")
+```
+
+# write session info
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "ChenAtlas_malignant_pseudobulk_prep_sessionInfo.txt")
+```

@@ -1,0 +1,425 @@
+---
+title: "Whitney Henry - scRNAseq Analysis - Baugh et al. - BH4 Paper Data Prep"
+author: "Charlie Whittaker"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/10/2026"
+---
+
+This notebook documents, in one place, every processing step between the public 10x outs directories and `singlet.integrated.tumor_chakrobortyMethod.rds` — the singlet, integrated and annotated RDS file.
+`baugh_BH4paper_figures.Rmd` uses this as input generate the three final manuscript panels. 
+
+The source code for this aggregate are in the original analysis directory:
+`baugh_01_dataImport.Rmd` -> `baugh_02_integration.Rmd` -> `baugh_03_integratedAnalysis.Rmd` ->
+`baugh_04_tumorCells.Rmd` -> `baugh_08_chakrobortyMethod.Rmd` (the single-cell EMT-scoring chunk)
+down to only the steps that actually feed that file, dropping the QC/diagnostic plots. See
+`baugh_BH4paper_figures_Methods.md` for the narrative pipeline and scoring/statistics methodology.
+
+**This notebook is not meant to be executed end to end.** Every stage below
+is guarded with `if (!file.exists(...))`: if a stage's output RDS is already present in this
+directory (as all of them are, as of this writing), that stage is skipped and the existing file
+is loaded instead. Only a stage whose output is missing — or deliberately deleted because an
+upstream input changed — actually re-runs. Several stages are slow and memory-hungry even when
+they do run: per-sample `DoubletFinder` (stage 1, minutes per sample), CCA integration across
+all 8 samples (stage 2) and again across the tumor subset (stage 4), and especially the
+non-vectorized, per-cell `KSScore()` call in stage 5 (tens of thousands of `ks.test()` triples —
+this is the step `baugh_08` itself keeps commented out for exactly this reason).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 5e10)
+```
+
+```{r load-libraries}
+library(openxlsx)
+library(tidyverse)
+library(Seurat)
+library(DoubletFinder)
+```
+
+```{r make-output-dirs}
+dir.create("doublet_called_rds", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)   # baugh_BH4paper_figures.Rmd writes here; not created by these notebooks otherwise
+```
+
+## Raw data
+
+The 8 per-sample 10x outs directories under `data/` (`NT2.5_V1`–`V4`, `NT2.5_LM_V1`–`V4`) are
+scRNA-seq data from:
+
+Baugh, A.G., Gonzalez, E., Narumi, V.H. et al. A new Neu—a syngeneic model of spontaneously
+metastatic HER2-positive breast cancer. *Clin Exp Metastasis* 41, 733–746 (2024).
+<https://doi.org/10.1007/s10585-024-10289-z>
+
+Downloaded from GEO accession
+[GSE261252](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE261252). GEO's supplementary
+files are named per-GSM (e.g. `GSM8138791_LTK_ERT_3_barcodes.tsv.gz`); `data/rename.sh` maps each
+GSM's three files into its sample directory's standard 10x names (`barcodes.tsv.gz`,
+`features.tsv.gz`, `matrix.mtx.gz`) so `Read10X()` below can read them directly. Run `rename.sh`
+from inside `data/` once the raw GEO downloads are arranged into the 8 sample directories, before
+running this notebook.
+
+# Stage 1: per-sample import, QC metadata, doublet calling
+
+Mirrors `baugh_01_dataImport.Rmd`. Each of the 8 samples (`NT2.5_V1`–`V4`,
+`NT2.5_LM_V1`–`V4`) is imported independently, given a first-pass clustering (needed only to
+estimate the homotypic doublet proportion for `DoubletFinder`), and doublet-annotated.
+QC violin/UMAP diagnostic plots from the original notebook are omitted here — they informed a
+decision ("don't exclude any clusters/cells beyond the filters below") already reflected in the
+fixed thresholds used in stage 2, not in code that needs to run again.
+
+`mu = 0.144` is the expected per-cell duplication rate for standard 10x GEM chemistry (`0.0722`
+for GEMX) — see `calculate_frac_dup()`.
+
+```{r frac-dup-function}
+calculate_frac_dup <- function(mu, num_cells) {
+  lambda <- mu * num_cells / 10000
+  prob_empty    <- dpois(0, lambda)
+  prob_single   <- dpois(1, lambda)
+  prob_multiple <- 1 - prob_empty - prob_single
+  prob_multiple / prob_single
+}
+```
+
+```{r stage1-per-sample-import-doublet-calling}
+all_dirs      <- list.dirs(path = "data")
+sample_dirs   <- grep("NT", all_dirs, value = TRUE)
+mu            <- 0.144
+
+for (dir in sample_dirs) {
+  condition   <- strsplit(dir, "/")[[1]][2]
+  out_file    <- file.path("doublet_called_rds", paste0(condition, ".seurat.rds"))
+
+  if (file.exists(out_file)) {
+    message(condition, ": ", out_file, " already exists, skipping.")
+    next
+  }
+
+  message("Processing ", condition, " ...")
+
+  sc         <- Read10X(data.dir = dir)
+  seurat_obj <- CreateSeuratObject(sc, min.cells = 3, min.features = 200, project = condition)
+  seurat_obj <- NormalizeData(seurat_obj)
+  seurat_obj <- FindVariableFeatures(seurat_obj)
+  seurat_obj <- ScaleData(seurat_obj)
+  seurat_obj <- RunPCA(seurat_obj)
+  seurat_obj <- RunUMAP(seurat_obj, reduction = "pca", dims = 1:30)
+  seurat_obj <- FindNeighbors(seurat_obj, dims = 1:30)
+  seurat_obj <- FindClusters(seurat_obj)   # default resolution 0.8 -> RNA_snn_res.0.8, used below for homotypic doublet modeling
+
+  seurat_obj[["Condition"]]  <- condition
+  seurat_obj[["percent.mt"]] <- PercentageFeatureSet(seurat_obj, pattern = "^mt-")
+  seurat_obj <- AddMetaData(seurat_obj, log2(seurat_obj@meta.data$nFeature_RNA), "l2.n_feature")
+  seurat_obj <- AddMetaData(seurat_obj, log2(seurat_obj@meta.data$nCount_RNA),   "l2.n_count")
+
+  # ── Expected doublet count from a Poisson per-cell duplication-rate model ───
+  num_cells  <- nrow(seurat_obj@meta.data)
+  dupRate    <- calculate_frac_dup(mu, num_cells)
+  nExp_poi   <- round(dupRate * num_cells)
+
+  # pK sweep is run (as in baugh_01) but pK is fixed at 0.09 below, not taken
+  # from the sweep result — preserved as-is from baugh_01 for fidelity to the
+  # doublet_called_rds/*.rds files already produced by that notebook.
+  sweep.res.list <- paramSweep(seurat_obj, PCs = 1:10, sct = TRUE)
+  sweep.stats    <- summarizeSweep(sweep.res.list, GT = FALSE)
+  bcmvn          <- find.pK(sweep.stats)
+
+  homotypic.prop <- modelHomotypic(seurat_obj@meta.data$RNA_snn_res.0.8)
+  nExp_poi.adj   <- round(nExp_poi * (1 - homotypic.prop))
+
+  # sct = TRUE above (paramSweep) vs sct = FALSE here is an inconsistency
+  # already baked into the existing doublet_called_rds/*.rds files; preserved
+  # rather than "fixed" so this notebook reproduces what's already on disk.
+  seurat_obj <- doubletFinder(seurat_obj, PCs = 1:10, pN = 0.25, pK = 0.09,
+                               nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+
+  saveRDS(seurat_obj, file = out_file)
+}
+```
+
+**Stage 1 output:** `doublet_called_rds/<sample>.seurat.rds` x 8.
+
+# Stage 2: merge, filter, normalize, integrate
+
+Mirrors `baugh_02_integration.Rmd`. Merges the 8 doublet-annotated samples, drops doublets and
+low-quality cells, then CCA-integrates across samples. The unintegrated
+`FindNeighbors`/`FindClusters`/`RunUMAP` pass in the original notebook was QC-only (used for a
+diagnostic `DimPlot`/`VlnPlot`, and its `RNA_snn_res.0.4` column is explicitly stripped back out
+in `baugh_04`) — it doesn't feed the integrated pipeline (`IntegrateLayers` only requires the
+`pca` reduction), so it's omitted here.
+
+```{r stage2-merge-filter-integrate}
+integration_out <- "singlet.integrated.rds"
+
+if (file.exists(integration_out)) {
+  message(integration_out, " already exists, loading it.")
+  singlet.integrated <- readRDS(integration_out)
+} else {
+
+  # ── Import the 8 doublet-called samples ──────────────────────────────────────
+  rds_files <- list.files("doublet_called_rds", pattern = "\\.rds$", full.names = TRUE)
+  sample_objs <- setNames(lapply(rds_files, readRDS), sub("\\.rds$", "", basename(rds_files)))
+  sample_order <- c("NT2.5_V1", "NT2.5_V2", "NT2.5_V3", "NT2.5_V4",
+                     "NT2.5_LM_V1", "NT2.5_LM_V2", "NT2.5_LM_V3", "NT2.5_LM_V4")
+
+  # DoubletFinder's classification column name is run-specific (embeds pN/pK/nExp);
+  # standardize it to `DF.classification` as baugh_02 does.
+  for (nm in names(sample_objs)) {
+    obj <- sample_objs[[nm]]
+    df_col <- grep("^DF.classifications", colnames(obj@meta.data), value = TRUE)
+    colnames(obj@meta.data)[colnames(obj@meta.data) == df_col] <- "DF.classification"
+    sample_objs[[nm]] <- obj
+  }
+
+  # ── Merge, keeping only singlets ───────────────────────────────────────────────
+  seurat.merge <- merge(
+    x = sample_objs[[paste0(sample_order[1], ".seurat")]],
+    y = lapply(sample_order[-1], function(s) sample_objs[[paste0(s, ".seurat")]]),
+    add.cell.ids = sample_order,
+    project = "baugh_scRNAseq"
+  )
+
+  Idents(seurat.merge) <- "DF.classification"
+  seurat.merge <- subset(seurat.merge, idents = "Singlet")
+
+  # ── Cell filtering ──────────────────────────────────────────────────────────────
+  seurat.merge <- subset(seurat.merge,
+                          subset = nFeature_RNA >= 200 & nFeature_RNA <= 8000 & percent.mt <= 15)
+
+  # ── Normalize, HVGs, scale (regress nCount_RNA + percent.mt), PCA ──────────────
+  seurat.merge <- NormalizeData(seurat.merge, normalization.method = "LogNormalize", scale.factor = 10000)
+  seurat.merge <- FindVariableFeatures(seurat.merge, selection.method = "vst", nfeatures = 2000)
+  seurat.merge <- ScaleData(seurat.merge, vars.to.regress = c("nCount_RNA", "percent.mt"))
+  seurat.merge <- RunPCA(seurat.merge, npcs = 50)
+
+  # ── Model metadata: collapse 4 replicates each into NT2.5 / NT2.5_LM ───────────
+  seurat.merge$Model <- ifelse(grepl("_LM_", seurat.merge$Condition), "NT2.5_LM", "NT2.5")
+
+  # ── CCA integration across the 8 samples ────────────────────────────────────────
+  DefaultAssay(seurat.merge) <- "RNA"
+  singlet.integrated <- IntegrateLayers(
+    object = seurat.merge, method = "CCAIntegration",
+    orig.reduction = "pca", new.reduction = "integrated.cca", verbose = FALSE
+  )
+
+  singlet.integrated <- FindNeighbors(singlet.integrated, dims = 1:30,
+                                       reduction = "integrated.cca", k.param = 10)
+  singlet.integrated <- FindClusters(singlet.integrated, resolution = 0.4,
+                                      cluster.name = "cca.clusters")
+  singlet.integrated <- RunUMAP(singlet.integrated, dims = 1:30,
+                                 reduction = "integrated.cca", reduction.name = "umap.cca")
+
+  saveRDS(singlet.integrated, integration_out)
+}
+```
+
+**Stage 2 output:** `singlet.integrated.rds` (~1.0 GB).
+
+# Stage 3: cell-type annotation
+
+Mirrors `baugh_03_integratedAnalysis.Rmd`, keeping only what stage 4 needs: the joined RNA
+layer and the manual `celltype` assignment that identifies which `cca.clusters` are tumor
+clusters. Azimuth and SingleR were run in `baugh_03` only as a cross-check against the manual
+marker-based assignment (final labels were always assigned manually) and are not needed to
+reproduce the tumor object, so they're omitted, as is the `FindAllMarkers` cluster-marker export
+and the NT2.5_LM-vs-NT2.5 differential expression testing (`Cluster_Markers.xlsx`,
+`NT2.5_LM_vs_NT2.5_by{Cluster,Celltype}_Markers.xlsx`) — none of those tables are read by
+`baugh_BH4paper_figures.Rmd`; see `baugh_03`/`baugh_03b` for that full analysis.
+
+Tumor-cluster identity (clusters 0, 1, 2, 4, 9, 10) was assigned from the marker panel in the
+source publication — **Lcn2, Wfdc2, Cd24a, Cd276, Col9a1, Erbb2** (the published list has
+apparent typos, "Lcn+"/"Wfd2c+"; no `Lcn`/`Wfd2c` genes exist in this dataset, and `Lcn2`/`Wfdc2`
+are the genes that actually mark these clusters). Non-tumor clusters were labeled by canonical
+markers (Fibroblast, Monocyte, Neutrophil, Endothelial, T cell, Macrophage) in `baugh_03`; that
+assignment is reproduced here as-is.
+
+```{r stage3-annotation}
+annotated_out <- "singlet.integrated_annotated.rds"
+
+if (file.exists(annotated_out)) {
+  message(annotated_out, " already exists, loading it.")
+  singlet.integrated <- readRDS(annotated_out)
+} else {
+
+  DefaultAssay(singlet.integrated) <- "RNA"
+  singlet.integrated <- JoinLayers(singlet.integrated)
+
+  Idents(singlet.integrated) <- singlet.integrated$cca.clusters
+  singlet.integrated <- RenameIdents(singlet.integrated,
+    "0" = "Tumor", "1" = "Tumor", "2" = "Tumor", "3" = "Fibroblast", "4" = "Tumor",
+    "5" = "Monocyte", "6" = "Neutrophil", "7" = "Fibroblast", "8" = "Endothelial",
+    "9" = "Tumor", "10" = "Tumor", "11" = "Tcell", "12" = "Macrophage"
+  )
+  singlet.integrated[["celltype"]] <- Idents(singlet.integrated)
+
+  saveRDS(singlet.integrated, annotated_out)
+}
+```
+
+**Stage 3 output:** `singlet.integrated_annotated.rds` (~1.1 GB).
+
+# Stage 4: tumor cell subsetting and re-integration
+
+Mirrors `baugh_04_tumorCells.Rmd`. Subsets to the tumor clusters identified above, drops
+annotation-related metadata that no longer applies to a tumor-only object, re-splits the RNA
+assay by sample, and reprocesses/re-integrates from scratch (a fresh CCA reduction,
+`integrated.cca.new`, kept distinct from the whole-dataset `integrated.cca`). Clustering is run
+once at three resolutions in the same `FindClusters()` call (`0.1`, `0.2`, `0.4`), reusing one
+SNN graph — `baugh_08`/`baugh_BH4paper_figures.Rmd` use the resolution-0.4 clustering for the
+final dot plot. Diagnostic DimPlots/VlnPlots from the original notebook are omitted.
+
+```{r stage4-tumor-subset-reintegrate}
+tumor_out <- "singlet.integrated.tumor_annotated.rds"
+
+if (file.exists(tumor_out)) {
+  message(tumor_out, " already exists, loading it.")
+  singlet.integrated.tumor <- readRDS(tumor_out)
+} else {
+
+  singlet.integrated.tumor <- subset(singlet.integrated, subset = cca.clusters %in% c(0, 1, 2, 4, 9, 10))
+
+  cols_to_remove <- grep("^predicted", colnames(singlet.integrated.tumor@meta.data), value = TRUE)
+  cols_to_remove <- c(cols_to_remove, "log10GenesPerUMI", "pANN",
+                       "DF.classification", "RNA_snn_res.0.4", "RNA_snn_res.0.8",
+                       "mapping.score", "singleR_mmRNASeq", "singleR_immgen",
+                       "clust.model", "celltype.model")
+  singlet.integrated.tumor@meta.data <-
+    singlet.integrated.tumor@meta.data[, !colnames(singlet.integrated.tumor@meta.data) %in% cols_to_remove]
+
+  # ── Re-split by sample and reprocess from scratch ───────────────────────────────
+  DefaultAssay(singlet.integrated.tumor) <- "RNA"
+  singlet.integrated.tumor[["RNA"]] <- split(singlet.integrated.tumor[["RNA"]], f = singlet.integrated.tumor$orig.ident)
+
+  singlet.integrated.tumor <- NormalizeData(singlet.integrated.tumor)
+  singlet.integrated.tumor <- FindVariableFeatures(singlet.integrated.tumor, nfeatures = 2000)
+  singlet.integrated.tumor <- ScaleData(singlet.integrated.tumor)
+  singlet.integrated.tumor <- RunPCA(singlet.integrated.tumor, npcs = 50)
+
+  singlet.integrated.tumor <- IntegrateLayers(
+    object         = singlet.integrated.tumor,
+    method         = CCAIntegration,
+    orig.reduction = "pca",
+    new.reduction  = "integrated.cca.new",   # kept distinct from the whole-dataset 'integrated.cca'
+    verbose        = TRUE
+  )
+
+  singlet.integrated.tumor <- FindNeighbors(singlet.integrated.tumor, reduction = "integrated.cca.new", dims = 1:30)
+  singlet.integrated.tumor <- FindClusters(singlet.integrated.tumor, resolution = c(0.1, 0.2, 0.4))
+  singlet.integrated.tumor <- RunUMAP(singlet.integrated.tumor, reduction = "integrated.cca.new",
+                                       dims = 1:30, reduction.name = "umap.cca.new")
+
+  for (res_col in c("RNA_snn_res.0.1", "RNA_snn_res.0.2", "RNA_snn_res.0.4")) {
+    vals <- singlet.integrated.tumor[[res_col, drop = TRUE]]
+    singlet.integrated.tumor[[res_col]] <- factor(vals, levels = sort(as.numeric(levels(factor(vals)))))
+  }
+
+  saveRDS(singlet.integrated.tumor, tumor_out)
+}
+```
+
+**Stage 4 output:** `singlet.integrated.tumor_annotated.rds` (~446 MB) — carries
+`RNA_snn_res.0.1`/`0.2`/`0.4`, `Model`, `orig.ident`, `celltype`.
+
+# Stage 5: canonical Chakraborty EMT KS score (single-cell)
+
+Mirrors the single-cell scoring chunks in `baugh_08_chakrobortyMethod.Rmd` (there, commented
+out and left as documentation since they were only run once, on 2026-09-02). This is the one
+step that actually produces `singlet.integrated.tumor_chakrobortyMethod.rds` —
+`baugh_BH4paper_figures.Rmd`'s sole input file.
+
+Uses the canonical, project-wide `KSScore()` (`../emt_code/Chakraborty_et_al_KS_code_vCAW.R`, the
+same implementation `Atlas_04_Malignant_pseudobulk.Rmd` uses), and the **tumor**
+`Epi.tum`/`Mes.tum` signature (`../emt_code/EM_gene_signature_tumor_KS.xlsx`) — not the Winkler et
+al. set used in `baugh_06`/`baugh_07`, which was judged a dead end for this project. Since this
+dataset is mouse, the human tumor signature is mapped to mouse orthologs via
+`../emt_code/Mouse_Human_Orthologs_OnetoOne.xlsx` and written out to
+`../emt_code/EM_gene_signature_tumor_mouse_KS.xlsx`, since `KSScore()` reads its gene lists from
+that file path (`KSScore.EMTSignature.file`) rather than as function arguments.
+`baugh_BH4paper_figures.Rmd` re-derives this same mouse-mapped signature itself (for its own,
+separate pseudobulk KS-score computation), so this file must exist wherever that notebook is
+knit from.
+
+**This is the slow step.** `KSScore()` is non-vectorized — 3 `ks.test()` calls per column of the
+input matrix — so run per cell (rather than per pseudobulk replicate) this is tens of thousands
+of KS tests. If this becomes a bottleneck, `baugh_07`'s vectorized rewrite of the same scoring
+logic (validated bit-identical to `ks.test()`, ~15–20x faster) is a drop-in option, at the cost
+of no longer sharing an implementation with the Wu_0x/Atlas_0x notebooks.
+
+```{r stage5-source-ks-code}
+source("../emt_code/Chakraborty_et_al_KS_code_vCAW.R")
+```
+
+```{r stage5-ks-score-singlecell}
+scored_out <- "singlet.integrated.tumor_chakrobortyMethod.rds"
+
+if (file.exists(scored_out)) {
+  message(scored_out, " already exists, loading it.")
+  singlet.integrated.tumor <- readRDS(scored_out)
+} else {
+
+  # ── Tumor EMT gene signature (human) ─────────────────────────────────────────
+  emt.tumor <- read.xlsx("../emt_code/EM_gene_signature_tumor_KS.xlsx", colNames = FALSE) %>%
+    dplyr::rename(gene = X1, group = X2)
+  Epi.tum <- emt.tumor$gene[emt.tumor$group == "Epi"]
+  Mes.tum <- emt.tumor$gene[emt.tumor$group == "Mes"]
+
+  # ── Map to mouse orthologs ────────────────────────────────────────────────────
+  MoHu.mapping <- read.xlsx("../emt_code/Mouse_Human_Orthologs_OnetoOne.xlsx")
+  Epi_mouse <- unique(na.omit(MoHu.mapping$Mouse_Sym[MoHu.mapping$HumanSym %in% Epi.tum]))
+  Mes_mouse <- unique(na.omit(MoHu.mapping$Mouse_Sym[MoHu.mapping$HumanSym %in% Mes.tum]))
+  cat("Epi:", length(Epi_mouse), "of", length(Epi.tum), "mapped\n")
+  cat("Mes:", length(Mes_mouse), "of", length(Mes.tum), "mapped\n")
+
+  # ── Write the mouse-mapped signature file KSScore() reads from ───────────────
+  mouse_sig <- data.frame(
+    gene  = c(Epi_mouse, Mes_mouse),
+    group = c(rep("Epi", length(Epi_mouse)), rep("Mes", length(Mes_mouse)))
+  )
+  KSScore.EMTSignature.file <- "../emt_code/EM_gene_signature_tumor_mouse_KS.xlsx"
+  write.xlsx(mouse_sig, KSScore.EMTSignature.file, colNames = FALSE)
+
+  # ── Single-cell KS score ───────────────────────────────────────────────────────
+  DefaultAssay(singlet.integrated.tumor) <- "RNA"
+  singlet.integrated.tumor <- JoinLayers(singlet.integrated.tumor)   # split by orig.ident since stage 4
+
+  logcpm_matrix  <- as.matrix(GetAssayData(singlet.integrated.tumor, assay = "RNA", layer = "data"))
+  emt.KSscore.sc <- KSScore(logcpm_matrix, gseID = "scRNAseq_chakroborty", outDirectory = "./")
+
+  singlet.integrated.tumor <- AddMetaData(singlet.integrated.tumor, metadata = emt.KSscore.sc, col.name = "EMT_KS_Score")
+
+  saveRDS(singlet.integrated.tumor, scored_out)
+}
+```
+
+**Stage 5 output:** `singlet.integrated.tumor_chakrobortyMethod.rds` (~446 MB) — the tumor
+object from stage 4 plus a per-cell `EMT_KS_Score` metadata column.
+
+**If the gene signature, the ortholog mapping, or the upstream annotated object changes, this
+cached file goes stale silently** — there's no automated check. Delete it (and, if the signature
+or mapping changed, `../emt_code/EM_gene_signature_tumor_mouse_KS.xlsx`) and re-knit this notebook
+to force a fresh score.
+
+# Summary: inputs required by `baugh_BH4paper_figures.Rmd`
+
+| File | Produced by | Notes |
+|---|---|---|
+| `singlet.integrated.tumor_chakrobortyMethod.rds` | Stage 5 (this notebook) | The only object the figures notebook reads |
+| `../emt_code/Chakraborty_et_al_KS_code_vCAW.R` | Pre-existing (project-wide, shared with Wu_0x/Atlas_0x) | Sourced directly, not regenerated |
+| `../emt_code/EM_gene_signature_tumor_KS.xlsx` | Pre-existing (project-wide) | Source (human) signature |
+| `../emt_code/Mouse_Human_Orthologs_OnetoOne.xlsx` | Pre-existing (project-wide) | 1:1 mouse-human ortholog table |
+| `../emt_code/EM_gene_signature_tumor_mouse_KS.xlsx` | Stage 5 (this notebook) | Mouse-mapped signature; re-derived and re-read by the figures notebook itself for its pseudobulk KS score |
+| `figures/` directory | `dir.create()` above | Must exist before `ggsave()` calls in the figures notebook run |
+
+Both notebooks are knit from within `Baugh/`, and `emt_code/` and
+`Mouse_Human_Orthologs_OnetoOne.xlsx` both live at the repo root — one level up — so both
+notebooks now use the same `../emt_code/...` paths.
+
+# write session info
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "baugh_BH4paper_prep_sessionInfo.txt")
+```

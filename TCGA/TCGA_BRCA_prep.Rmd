@@ -1,0 +1,152 @@
+---
+title: "TCGA PANCAN RNAseq - Data Import and preparation"
+author: "Charlie Whittaker"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "8/3/2026"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 5e10)
+set.seed(1234)
+```
+
+# Goal
+
+Load the TCGA PANCAN batch-corrected expression matrix and the matched
+clinical/metadata table, assemble a single Seurat object (one "cell" per
+tumor sample, following the convention used elsewhere in this project), and
+save it for downstream EMT/gene-set scoring.
+
+## Raw data
+
+`data/geneexpressionmatrix_uniqueIDs.txt` (the Firehose `EBPlusPlusAdjustPANCAN`
+batch-corrected matrix) and `data/Updated_Metadata_fixed.txt` (matched clinical
+metadata) are from the TCGA Pan-Cancer Atlas project. The GDC/Broad Firehose
+pages that originally hosted these files are no longer live, so no working
+download link is available; the traceable provenance reference for this
+dataset is the associated publication:
+
+Liu, J., Lichtenberg, T., Hoadley, K.A. et al. An Integrated TCGA Pan-Cancer
+Clinical Data Resource to Drive High-Quality Survival Outcome Analytics.
+*Cell* 173(2), 400–416.e11 (2018).
+<https://doi.org/10.1016/j.cell.2018.02.052>
+(<https://www.sciencedirect.com/science/article/pii/S0092867418302290>)
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(Matrix)
+library(Seurat)
+```
+
+# Load expression matrix
+
+`geneexpressionmatrix_uniqueIDs.txt` is the Broad Firehose
+`EBPlusPlusAdjustPANCAN` batch-corrected RSEM matrix (genes x samples,
+continuous values -- not raw counts). `read.table()`'s default
+`check.names = TRUE` runs `make.names()` on the sample-barcode column
+headers, converting the hyphens in TCGA barcodes (e.g.
+`TCGA-02-0047-01A-01R-1849-01`) to dots -- this is why the metadata barcodes
+get the same substitution below, to keep the two joinable.
+
+```{r load-expr-matrix}
+gene_expr <- read.table("data/geneexpressionmatrix_uniqueIDs.txt", header = TRUE, row.names = 1, sep = "\t")
+dim(gene_expr)
+```
+
+```{r clean-expr-matrix}
+# Replace non-finite values (NA/NaN/Inf) with 0. Deliberately NOT rounding to
+# integers here (unlike the earlier TCGA_analysis_*.Rmd scripts) -- these are
+# already continuous batch-corrected values, and the EMT-scoring methods
+# (KSScore, GSVA, UCell) all expect continuous expression, so rounding would
+# only throw away precision for no benefit.
+gene_expr <- gene_expr %>% mutate(across(everything(), ~replace(., is.na(.) | is.infinite(.) | is.nan(.), 0)))
+```
+
+# Build the Seurat object
+
+```{r create-seurat-object}
+seurat_obj <- CreateSeuratObject(gene_expr)
+seurat_obj
+```
+
+# Attach sample metadata
+
+```{r load-metadata}
+metadata <- read.delim("data/Updated_Metadata_fixed.txt")
+metadata$bcr_patient_barcode <- gsub("-", ".", metadata$bcr_patient_barcode)
+```
+
+```{r dedup-metadata}
+nrow(metadata)
+metadata <- distinct(metadata)
+nrow(metadata)
+```
+
+Index by barcode and hand the whole table to `AddMetaData()` in one call --
+this replaces the old pattern of one `setNames()` + `AddMetaData()` pair per
+column (30 repetitions in the earlier scripts) with a single call that adds
+every column at once; samples in `seurat_obj` without a metadata match get
+`NA` for all fields, same as before.
+
+```{r attach-metadata}
+rownames(metadata) <- metadata$bcr_patient_barcode
+seurat_obj <- AddMetaData(seurat_obj, metadata = metadata)
+
+head(seurat_obj@meta.data)
+```
+
+# Sanity checks
+
+```{r sanity-check-coverage}
+# How many samples in the expression matrix got no metadata match?
+sum(is.na(seurat_obj$type))
+
+# Sample counts per cancer type
+table(seurat_obj$type, useNA = "ifany")
+```
+
+# QC violin plots
+
+```{r qc-violin, fig.width=8, fig.height=5}
+VlnPlot(seurat_obj, features = c("nCount_RNA", "nFeature_RNA"))
+```
+
+type_order <- tcga@meta.data %>%
+  group_by(type) %>%
+  summarize(median_nCount = median(nCount_RNA, na.rm = TRUE)) %>%
+  arrange(desc(median_nCount)) %>%
+  pull(type)
+
+tcga$type <- factor(tcga$type, levels = type_order)
+
+VlnPlot(tcga, features = "nCount_RNA", group.by = "type", pt.size = 0)
+```
+
+# Subset PANCANCER object to BRCA
+
+```{r load-and-subset}
+tcga_brca <- subset(seurat_obj, subset = type == "BRCA")
+
+ncol(seurat_obj)   # pan-cancer sample count
+ncol(tcga_brca)  # BRCA-only sample count
+```
+
+# Save BRCA object
+
+```{r}
+saveRDS(tcga_brca, file="TCGA_BRCA_seurat.rds")
+```
+
+# write session info
+
+Capturing information about the R session helps document your work
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "TCGA_BRCA_prep_sessionInfo.txt")
+```

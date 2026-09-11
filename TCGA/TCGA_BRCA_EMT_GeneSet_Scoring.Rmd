@@ -1,0 +1,750 @@
+---
+title: "TCGA BRCA RNAseq - EMT and Gene Set Scoring (BRCA subset, rescored)"
+author: "Charlie Whittaker"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "8/11/2026"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 5e10)
+set.seed(1234)
+```
+
+# Purpose
+
+`TCGA_EMT_GeneSet_Scoring.Rmd` scores EMT (KS) and gene sets (GSVA,
+ssGSEA, UCell) once, pan-cancer, across all ~11,069 TCGA samples. This
+notebook picks up that already-scored object, subsets it down to BRCA
+only (~1,215 samples), and re-runs all scoring methods on the BRCA subset
+alone. Every sample here is BRCA, so the KS score isn't given a
+distinguishing suffix -- it's recomputed under its original column name
+and simply overwrites the inherited pan-cancer values; GSVA/ssGSEA/UCell
+are (re)scored against `pathways_to_score` only (see below), so those
+columns are new regardless.
+
+**Why this isn't a no-op for every method** -- the scoring methods differ
+in whether they reference the rest of the cohort at all:
+
+- **KSScore()** -- a per-sample KS test comparing that one sample's own
+  Epi-gene values against its own Mes-gene values. Never looks at other
+  samples, so BRCA-only and pan-cancer-context KS scores for the same
+  sample are expected to be numerically identical.
+- **GSVA/ssGSEA** -- even with `kcdf = "none"`, each gene's expression is
+  converted to a rank/ECDF value computed *across all samples in the
+  input matrix*. A smaller, BRCA-only background is a different
+  reference population, so these scores are expected to shift.
+- **UCell** -- ranks genes *within each sample* only, never across
+  samples, so like KS it's expected to be numerically identical whether
+  run pan-cancer or BRCA-only.
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(openxlsx)
+library(ggpubr)
+library(Seurat)
+library(GSVA)
+library(UCell)
+library(ComplexHeatmap)
+```
+
+# Load TCGA BRCA object
+
+```{r load-and-subset}
+tcga_brca  <- readRDS("TCGA_BRCA_seurat.rds")
+```
+
+# Log-transform
+
+`CreateSeuratObject()` only populates the `counts` layer, not `data` --
+this creates `data` directly from `counts` (log2-transformed) rather than
+going through `NormalizeData()`, whose per-sample total-count division is
+the extra normalization step decided against above.
+
+```{r log-transform}
+DefaultAssay(tcga_brca) <- "RNA"
+tcga_brca <- SetAssayData(
+  tcga_brca, layer = "data",
+  new.data = log2(GetAssayData(tcga_brca, layer = "counts") + 1)
+)
+# if `layer` isn't accepted for this assay class/Seurat version, use:
+# slot = "data" / slot = "counts" instead
+```
+
+# Point to ks signature file and read in gene sets
+
+```{r ks-signature-genes}
+KSScore.EMTSignature.file <- "../emt_code/EM_gene_signature_tumor_KS.xlsx"
+
+emt.tumor <- read.xlsx("../emt_code/EM_gene_signature_tumor_KS.xlsx", colNames = FALSE)
+emt.tumor <- emt.tumor %>% dplyr::rename(gene = X1, group = X2)
+Epi.tum <- emt.tumor$gene[emt.tumor$group == "Epi"]
+Mes.tum <- emt.tumor$gene[emt.tumor$group == "Mes"]
+```
+
+# Pathway gene sets for GSVA scoring
+
+```{r}
+# BH4 synthesis and recycling
+BH4 <- c("DHFR", "GCH1", "PCBD1", "PCBD2", "PTS", "QDPR", "SPR")
+
+# De novo BH4 synthesis only
+BH4.synth <- c("GCH1", "PTS", "SPR")
+
+# BH4 recycling and regeneration only
+BH4.recyc <- c("QDPR", "DHFR", "PCBD1", "PCBD2")
+
+# Cystine uptake and GSH synthesis/recycling
+Glutathione <- c("SLC7A11", "SLC3A2", "GCLC", "GCLM", "GSS", "GSR")
+
+# CoQ/Ubiquinol biosynthesis
+CoQ10 <- c("COQ2", "COQ3", "COQ4", "COQ5", "COQ6", "COQ7",
+            "COQ8A", "COQ8B", "COQ9", "HPDL", "PDSS1", "PDSS2", "STARD7")
+
+# Thioredoxin system
+Thioredoxin <- c("TXN", "TXNRD1", "TXN2", "TXNRD2")
+
+# Canonical peroxiredoxins
+Peroxiredoxin <- c("PRDX1", "PRDX2", "PRDX3", "PRDX4", "PRDX5")
+
+# Individual genes
+goi <- c("GPX4", "AIFM2", "DHODH", "PRDX6")
+```
+
+## Create a list of these gene sets, except for GOI
+
+```{r}
+pathways_to_score <- list(
+  BH4           = BH4,
+  BH4.synth     = BH4.synth,
+  BH4.recyc     = BH4.recyc,
+  Glutathione   = Glutathione,
+  CoQ10         = CoQ10,
+  Thioredoxin   = Thioredoxin,
+  Peroxiredoxin = Peroxiredoxin,
+  Epi.tum       = Epi.tum,
+  Mes.tum       = Mes.tum)
+```
+
+# Re-score EMT on the BRCA subset
+
+## KS method (Chakraborty/Bell)
+
+```{r source-ks-method}
+source("../emt_code/Chakraborty_et_al_KS_code_vCAW.R")
+```
+
+```{r rescore-ks}
+emt_genes <- unique(c(Epi.tum, Mes.tum))
+
+expr_matrix_brca <- GetAssayData(tcga_brca, layer = "data")
+expr_matrix_brca <- expr_matrix_brca[rownames(expr_matrix_brca) %in% emt_genes, ]
+expr_matrix_brca <- as.matrix(expr_matrix_brca)
+dim(expr_matrix_brca)
+
+ks_tumor_brca <- suppressWarnings(KSScore(expr_matrix_brca, "TCGA_BRCAonly_tumorSig", "."))
+
+tcga_brca$EMT_KS_TumorSig <- ks_tumor_brca[colnames(tcga_brca)]
+```
+
+# Score pathway gene sets (BH4/redox panel + Epi.tum/Mes.tum)
+
+## GSVA
+
+```{r score-gsva}
+expr_matrix_full_brca <- as.matrix(GetAssayData(tcga_brca, layer = "data"))
+dim(expr_matrix_full_brca)
+
+gsva_param_brca <- gsvaParam(expr_matrix_full_brca, pathways_to_score, kcdf = "none")
+gsva_scores_brca <- gsva(gsva_param_brca)
+dim(gsva_scores_brca)  # expect 9 gene sets x ncol(tcga_brca)
+
+gsva_scores_brca_df <- as.data.frame(t(gsva_scores_brca))
+colnames(gsva_scores_brca_df) <- paste0(colnames(gsva_scores_brca_df), "_GSVA")
+
+tcga_brca <- AddMetaData(tcga_brca, gsva_scores_brca_df)
+```
+
+## ssGSEA
+
+Reuses `expr_matrix_full_brca` and `pathways_to_score` from the GSVA step
+above, scored with `ssgseaParam()` instead of `gsvaParam()`.
+
+```{r score-ssgsea}
+ssgsea_param_brca <- ssgseaParam(expr_matrix_full_brca, pathways_to_score, normalize = TRUE)
+ssgsea_scores_brca <- gsva(ssgsea_param_brca)
+dim(ssgsea_scores_brca)  # expect 9 gene sets x ncol(tcga_brca)
+
+ssgsea_scores_brca_df <- as.data.frame(t(ssgsea_scores_brca))
+colnames(ssgsea_scores_brca_df) <- paste0(colnames(ssgsea_scores_brca_df), "_ssGSEA")
+
+tcga_brca <- AddMetaData(tcga_brca, ssgsea_scores_brca_df)
+```
+
+## UCell
+
+Reuses `pathways_to_score` from above, scored directly on `tcga_brca`'s
+`data` layer with `AddModuleScore_UCell()` (`maxRank = 10000`).
+
+```{r score-ucell}
+tcga_brca <- AddModuleScore_UCell(
+  tcga_brca, features = pathways_to_score, maxRank = 10000,
+  slot = "data", name = "_UCell"
+)
+
+ucell_cols_brca <- grep("_UCell$", colnames(tcga_brca@meta.data), value = TRUE)
+ucell_cols_brca
+```
+
+# Save re-scored BRCA object
+
+```{r save-brca-scored}
+saveRDS(tcga_brca, "TCGA_BRCA_seurat_EMTscored.rds")
+```
+
+# KS tertiles, based on the new BRCA scores
+
+Same tertile logic as `Atlas_05`/`TCGA_EMT_GeneSet_Scoring.Rmd`, applied
+to the newly-computed BRCA KS scores, so the visualizations below reflect
+BRCA-calibrated groupings.
+
+```{r ks-tertile-group}
+.ksTertileGroup <- function(x) {
+  ks_tertiles <- quantile(x, probs = c(1/3, 2/3), na.rm = TRUE)
+  cut(x, breaks = c(-Inf, ks_tertiles[1], ks_tertiles[2], Inf),
+      labels = c("KS_low", "KS_mid", "KS_high"))
+}
+
+tcga_brca$KS_Group <- .ksTertileGroup(tcga_brca$EMT_KS_TumorSig)
+
+table(tcga_brca$KS_Group)
+```
+
+# Compare GSVA vs ssGSEA scoring
+
+Same 9 gene sets (`pathways_to_score`), GSVA score vs ssGSEA score for
+each, one panel per gene set.
+
+```{r gsva-vs-ssgsea-data}
+gsva_ssgsea_long <- purrr::map_dfr(names(pathways_to_score), function(gs) {
+  tibble(
+    GeneSet = gs,
+    GSVA    = tcga_brca@meta.data[[paste0(gs, "_GSVA")]],
+    ssGSEA  = tcga_brca@meta.data[[paste0(gs, "_ssGSEA")]]
+  )
+}) %>%
+  mutate(GeneSet = factor(GeneSet, levels = names(pathways_to_score)))
+```
+
+```{r gsva-vs-ssgsea-scatter, fig.width=10, fig.height=10}
+ggplot(gsva_ssgsea_long, aes(x = GSVA, y = ssGSEA)) +
+  geom_point(size = 0.6, alpha = 0.4) +
+  geom_smooth(method = "lm", color = "red", linewidth = 0.6, se = FALSE) +
+  stat_cor(size = 3) +
+  facet_wrap(~ GeneSet, ncol = 3, scales = "free") +
+  theme_bw() +
+  labs(x = "GSVA score", y = "ssGSEA score",
+       title = "GSVA vs ssGSEA score, by gene set (TCGA BRCA)")
+```
+
+# BH4 (+ subsets) score by KS tertile
+
+Same decomposition as `Atlas_05`/`TCGA_EMT_GeneSet_Scoring.Rmd`'s BH4 box
+plots, using the BRCA GSVA scores and KS tertile groups.
+
+```{r bh4-long-scores-fn}
+.bh4LongScores <- function(object, group_var) {
+  score_vars <- c("BH4_GSVA", "BH4.synth_GSVA", "BH4.recyc_GSVA")
+
+  FetchData(object, vars = c(score_vars, group_var)) %>%
+    pivot_longer(cols = all_of(score_vars), names_to = "col_name", values_to = "Score") %>%
+    dplyr::mutate(
+      GeneSet = factor(sub("_GSVA$", "", col_name), levels = c("BH4", "BH4.synth", "BH4.recyc"))
+    )
+}
+```
+
+```{r bh4-boxplot-by-ksgroup, fig.width=13, fig.height=4}
+bh4_ks_long <- .bh4LongScores(tcga_brca, "KS_Group")
+bh4_ks_group_n <- table(tcga_brca$KS_Group)
+
+ggplot(bh4_ks_long, aes(x = KS_Group, y = Score, fill = KS_Group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8, linewidth = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  facet_wrap(~ GeneSet, ncol = 3, scales = "free_y") +
+  theme_bw() +
+  theme(
+    panel.grid   = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+    axis.title   = element_text(face = "bold", size = 13),
+    axis.text    = element_text(face = "bold", size = 11)
+  ) +
+  NoLegend() +
+  scale_x_discrete(labels = function(l) paste0(l, "\n(n=", bh4_ks_group_n[l], ")")) +
+  labs(x = NULL, y = "GSVA score")
+```
+
+## BH4 (GSVA) score vs EMT KS score
+
+```{r bh4-vs-ks-scatter, fig.width=5, fig.height=5}
+ggplot(tcga_brca@meta.data, aes(x = EMT_KS_TumorSig, y = BH4_GSVA)) +
+  geom_point(size = 0.8, alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red", linewidth = 0.6, se = FALSE) +
+  stat_cor(size = 3) +
+  theme_bw() +
+  labs(x = "EMT KS score", y = "BH4 score (GSVA)",
+       title = "BH4 score (GSVA) vs EMT KS score")
+```
+
+## BH4 gene expression vs EMT KS score
+
+Raw expression (not the gene-set score) for each of BH4's 7 genes,
+individually, against the BRCA KS score -- `facet_wrap(~ Gene, ncol = 2)`
+lays 7 genes out as 4 rows x 2 columns (last cell empty).
+
+```{r bh4-genes-vs-emt-data}
+bh4_gene_expr_long <- FetchData(tcga_brca, vars = c(BH4, "EMT_KS_TumorSig")) %>%
+  pivot_longer(cols = all_of(BH4), names_to = "Gene", values_to = "Expression")
+```
+
+```{r bh4-genes-vs-ks-scatter, fig.width=8, fig.height=12}
+ggplot(bh4_gene_expr_long, aes(x = EMT_KS_TumorSig, y = Expression)) +
+  geom_point(size = 0.6, alpha = 0.4) +
+  geom_smooth(method = "lm", color = "red", linewidth = 0.6, se = FALSE) +
+  stat_cor(size = 3) +
+  facet_wrap(~ Gene, ncol = 2, scales = "free_y") +
+  theme_bw() +
+  labs(x = "EMT KS score", y = "Log-normalized expression",
+       title = "BH4 gene expression vs EMT KS score")
+```
+
+# Manual dot plots
+
+Same manual mean-expression/pct-expressed dot plot as
+`TCGA_EMT_GeneSet_Scoring.Rmd`/`Atlas_05`. `type` isn't a useful grouping
+here (every sample is BRCA), so this uses `KS_Group` instead.
+
+```{r manual-dotplot-fn}
+.manualDotPlotData <- function(object, genes, group_var, assay = "RNA", layer = "data") {
+  expr_data <- GetAssayData(object, assay = assay, layer = layer)
+
+  missing_genes <- setdiff(genes, rownames(expr_data))
+  if (length(missing_genes) > 0) {
+    stop("Gene(s) not found in ", assay, "/", layer, ": ", paste(missing_genes, collapse = ", "))
+  }
+  expr_data <- expr_data[genes, , drop = FALSE]
+
+  groups <- object@meta.data[[group_var]]
+  group_levels <- if (is.factor(groups)) levels(groups) else sort(unique(groups))
+
+  dot_long <- purrr::map_dfr(group_levels, function(g) {
+    # which(), not `groups == g` directly -- groups may contain NA, and NA
+    # in a logical index produces an NA element in the result rather than
+    # being dropped, which then errors out sparse-Matrix column indexing
+    cells_in_group <- colnames(object)[which(groups == g)]
+    expr_g <- expr_data[, cells_in_group, drop = FALSE]
+    tibble(
+      gene    = genes,
+      group   = g,
+      meanExp = Matrix::rowMeans(expr_g),
+      pctExp  = Matrix::rowMeans(expr_g > 0) * 100
+    )
+  })
+
+  dot_long %>%
+    dplyr::group_by(gene) %>%
+    dplyr::mutate(
+      zscore  = as.numeric(scale(meanExp)),
+      # min-max normalized per gene, 0-1 -- z-score gets unstable/exaggerated
+      # with very few groups (e.g. 3 KS tertiles: scale() on n=3 points can
+      # look extreme), so this is the steadier option for small group
+      # counts. Not meaningful with 1 group (denominator is 0 -> NaN).
+      normExp = (meanExp - min(meanExp)) / (max(meanExp) - min(meanExp))
+    ) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      gene  = factor(gene, levels = genes),
+      group = factor(group, levels = group_levels)
+    )
+}
+
+.manualDotPlot <- function(dot_long, x_lab = "Gene", y_lab = "Group",
+                            color_by = c("zscore", "normExp")) {
+  color_by <- match.arg(color_by)
+
+  if (color_by == "zscore") {
+    lim <- max(abs(dot_long$zscore), na.rm = TRUE)
+    lim <- ifelse(lim == 0, 1, lim)
+
+    p <- ggplot(dot_long, aes(x = gene, y = group)) +
+      geom_point(aes(size = pctExp, color = zscore)) +
+      scale_color_gradientn(
+        colors = c("#2F6FB2", "#9FC3DF", "#F4EFE6", "#F28E5C", "#E84A3A"),
+        values = scales::rescale(c(-lim, -lim / 3, 0, lim / 3, lim)),
+        limits = c(-lim, lim),
+        name   = "Z-score\nmean expr."
+      )
+  } else {
+    p <- ggplot(dot_long, aes(x = gene, y = group)) +
+      geom_point(aes(size = pctExp, color = normExp)) +
+      scale_color_gradientn(
+        colors = c("#2F6FB2", "#9FC3DF", "#F4EFE6", "#F28E5C", "#E84A3A"),
+        limits = c(0, 1),
+        name   = "Normalized\nmean expr."
+      )
+  }
+
+  p +
+    scale_size_continuous(name = "% expressed", range = c(0.5, 10)) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x  = element_text(angle = 45, hjust = 1, face = "italic"),
+      panel.grid   = element_blank(),
+      panel.border = element_rect(colour = "grey40", fill = NA, linewidth = 0.6)
+    ) +
+    labs(x = x_lab, y = y_lab)
+}
+```
+
+## BH4 genes: dot plot by KS tertile
+
+```{r dotplot-bh4-by-ksgroup, fig.width=8, fig.height=5}
+bh4_dot_ksgroup <- .manualDotPlotData(tcga_brca, BH4, "KS_Group")
+.manualDotPlot(bh4_dot_ksgroup, x_lab = "Gene", y_lab = "KS tertile", color_by = "normExp")
+```
+
+# Gene-set score heatmap
+
+Same heatmap strategy as `TCGA_EMT_GeneSet_Scoring.Rmd`/`Atlas_05` --
+9 already-scored gene-set columns plus `goi`'s 4 genes' raw expression,
+samples ordered by `EMT_KS_TumorSig`, rows in a fixed order
+(`Epi.tum`/`Mes.tum` right below the color bar, then the pathway gene
+sets in their existing order, then `goi`), z-scored per row, with
+`EMT_KS_TumorSig` as a continuous color bar, and a row-side strip
+distinguishing gene-set-score rows from `goi`'s raw-expression rows.
+
+```{r genesetscore-heatmap-fn}
+.geneSetScoreHeatmap <- function(object, suffix, title) {
+  score_set_order <- c("Epi.tum", "Mes.tum", "BH4", "BH4.synth", "BH4.recyc",
+                        "Glutathione", "CoQ10", "Thioredoxin", "Peroxiredoxin")
+  score_cols_hm <- paste0(score_set_order, suffix)
+
+  ks_order  <- order(object@meta.data$EMT_KS_TumorSig)
+  ks_values <- object@meta.data$EMT_KS_TumorSig[ks_order]
+
+  score_mat <- t(as.matrix(FetchData(object, vars = score_cols_hm)))
+  score_mat <- score_mat[, ks_order]
+  rownames(score_mat) <- sub(suffix, "", rownames(score_mat))
+
+  goi_expr <- GetAssayData(object, assay = "RNA", layer = "data")[goi, , drop = FALSE]
+  goi_mat  <- as.matrix(goi_expr)[, ks_order, drop = FALSE]
+
+  combined_mat    <- rbind(score_mat, goi_mat)
+  combined_scaled <- t(scale(t(combined_mat)))
+
+  ks_cols <- circlize::colorRamp2(c(min(ks_values), max(ks_values)), c("darkorange", "lightgreen"))
+
+  col_anno <- HeatmapAnnotation(
+    EMT_KS_TumorSig = ks_values,
+    col = list(EMT_KS_TumorSig = ks_cols)
+  )
+
+  row_type <- factor(
+    c(rep("Gene set score", length(score_set_order)), rep("Gene (goi)", length(goi))),
+    levels = c("Gene set score", "Gene (goi)")
+  )
+  row_anno <- rowAnnotation(
+    `Row type` = row_type,
+    col = list(`Row type` = c("Gene set score" = "#666666", "Gene (goi)" = "#F2A104")),
+    show_annotation_name = FALSE
+  )
+
+  Heatmap(combined_scaled,
+          name              = "z-score",
+          top_annotation    = col_anno,
+          left_annotation   = row_anno,
+          cluster_columns   = FALSE,
+          cluster_rows      = FALSE,
+          show_column_names = FALSE,
+          column_title      = paste0(title, ", ordered by EMT_KS_TumorSig (Epi -> Mes)"),
+          row_title         = "Gene set score / gene expression")
+}
+
+score_cols_hm_suffix_gsva <- "_GSVA"
+```
+
+```{r heatmap-gsva, fig.width=11, fig.height=8}
+.geneSetScoreHeatmap(tcga_brca, score_cols_hm_suffix_gsva, "TCGA BRCA (GSVA)")
+```
+
+# Requested Figures
+
+Same single-panel boxplot design as `TCGA_EMT_GeneSet_Scoring.Rmd`/
+`Atlas_05` -- one gene set at a time, one panel, tight whisker-based
+y-axis, and every pairwise comparison shown (not just the non-significant
+ones), with black brackets and BH-adjusted p-value labels. No omnibus
+Kruskal-Wallis annotation: with ~1,215 BRCA samples split 3 ways, it comes
+back significant on essentially every panel regardless of effect size, and
+it isn't gating anything here (the pairwise brackets render either way) --
+so it added a second, less specific p-value rather than new information.
+Parameterized by `method` (`"GSVA"`/`"ssGSEA"`/`"UCell"`) so the same
+functions drive all three sets of figures below. Different, more targeted
+view than the existing "BH4 (+ subsets) score by KS tertile" section
+above (which covers BH4/BH4.synth/BH4.recyc together, no significance
+testing) -- not a replacement for it.
+
+```{r bh4-single-panel-fn}
+.tightBoxYlim <- function(df, y_col, group_col) {
+  group_ranges <- tapply(df[[y_col]], df[[group_col]], function(y) {
+    range(boxplot.stats(y)$stats)
+  })
+  c(min(sapply(group_ranges, min)), max(sapply(group_ranges, max)))
+}
+
+# All pairwise Wilcoxon tests among group_col's levels, BH-adjusted --
+# returns EVERY pair, tagged `significant` (p.adj < 0.05), with the
+# BH-adjusted p-value itself as the label (not significance stars). Pairs
+# with too few samples in either group are silently skipped rather than
+# erroring.
+.bh4PairwiseTests <- function(df, y_col, group_col, min_n = 2) {
+  groups <- levels(df[[group_col]])
+  pairs  <- utils::combn(groups, 2, simplify = FALSE)
+
+  res <- purrr::map_dfr(pairs, function(pr) {
+    x <- df[[y_col]][df[[group_col]] == pr[1]]
+    y <- df[[y_col]][df[[group_col]] == pr[2]]
+    if (length(x) < min_n || length(y) < min_n) return(tibble())
+    tibble(group1 = pr[1], group2 = pr[2], p = wilcox.test(x, y)$p.value)
+  })
+
+  if (nrow(res) == 0) return(res)
+
+  res$p.adj       <- p.adjust(res$p, method = "BH")
+  res$significant <- res$p.adj < 0.05
+  res$p.label     <- paste0("p = ", formatC(res$p.adj, format = "g", digits = 2))
+  res
+}
+
+.bh4SinglePanel <- function(object, group_var, x_lab, method = c("GSVA", "ssGSEA", "UCell"),
+                             add_pairwise_brackets = TRUE) {
+  method    <- match.arg(method)
+  score_col <- paste0("BH4_", method)
+
+  df <- FetchData(object, vars = c(score_col, group_var))
+  colnames(df)[colnames(df) == score_col] <- "Score"
+  colnames(df)[colnames(df) == group_var]  <- "Group"
+
+  ylim_vals <- .tightBoxYlim(df, "Score", "Group")
+
+  pairwise <- NULL
+  if (add_pairwise_brackets) {
+    pairwise <- .bh4PairwiseTests(df, "Score", "Group")
+    if (nrow(pairwise) > 0) {
+      # brackets stack above the box tops -- extend the tight range just
+      # enough to fit however many are actually being drawn
+      step <- 0.12 * diff(ylim_vals)
+      pairwise$y.position <- ylim_vals[2] + seq_len(nrow(pairwise)) * step
+      ylim_vals[2] <- max(pairwise$y.position) + step * 0.5
+    }
+  }
+
+  group_n <- table(df$Group)
+
+  p <- ggplot(df, aes(x = Group, y = Score, fill = Group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.8, linewidth = 0.7) +
+    coord_cartesian(ylim = ylim_vals) +
+    theme_bw() +
+    theme(
+      panel.grid   = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+      axis.title   = element_text(face = "bold", size = 13),
+      axis.text    = element_text(face = "bold", size = 11)
+    ) +
+    NoLegend() +
+    scale_x_discrete(labels = function(l) paste0(l, "\n(n=", group_n[l], ")")) +
+    labs(x = NULL, y = paste0(method, " score"))
+
+  if (add_pairwise_brackets && !is.null(pairwise) && nrow(pairwise) > 0) {
+    p <- p + ggpubr::stat_pvalue_manual(
+      pairwise, label = "p.label", tip.length = 0.01,
+      color = "black", fontface = "bold", bracket.size = 0.6
+    )
+  }
+
+  p
+}
+```
+
+```{r bh4-gsva-boxplot-by-ksgroup, fig.width=4, fig.height=3}
+.bh4SinglePanel(tcga_brca, "KS_Group", "KS tertile", method = "GSVA")
+```
+
+```{r bh4-ssgsea-boxplot-by-ksgroup, fig.width=5, fig.height=5}
+fig.5c <- .bh4SinglePanel(tcga_brca, "KS_Group", "KS tertile", method = "ssGSEA")
+
+ggsave("figures/Fig5c_ssgsea_BH4_TCGA_BRCA.svg", plot = fig.5c, width = 5, height = 5, dpi = 300)
+
+fig.5c
+```
+
+```{r bh4-ucell-boxplot-by-ksgroup, fig.width=4, fig.height=3}
+.bh4SinglePanel(tcga_brca, "KS_Group", "KS tertile", method = "UCell")
+```
+
+## Same single-panel design, any gene set
+
+Generalizes `.bh4SinglePanel()` to take a `gene_set` argument instead of
+being hardcoded to BH4 -- everything else (tight whisker-based y-axis,
+all-pairwise brackets in black, the GSVA/ssGSEA/UCell `method` switch) is
+identical. Reuses `.tightBoxYlim()`/`.bh4PairwiseTests()` from
+`bh4-single-panel-fn` above as-is, since neither one actually references
+BH4 specifically.
+
+```{r genesetscore-single-panel-fn}
+.geneSetSinglePanel <- function(object, gene_set, group_var, x_lab,
+                                 method = c("GSVA", "ssGSEA", "UCell"),
+                                 add_pairwise_brackets = TRUE) {
+  method    <- match.arg(method)
+  score_col <- paste0(gene_set, "_", method)
+
+  df <- FetchData(object, vars = c(score_col, group_var))
+  colnames(df)[colnames(df) == score_col] <- "Score"
+  colnames(df)[colnames(df) == group_var] <- "Group"
+
+  ylim_vals <- .tightBoxYlim(df, "Score", "Group")
+
+  pairwise <- NULL
+  if (add_pairwise_brackets) {
+    pairwise <- .bh4PairwiseTests(df, "Score", "Group")
+    if (nrow(pairwise) > 0) {
+      step <- 0.12 * diff(ylim_vals)
+      pairwise$y.position <- ylim_vals[2] + seq_len(nrow(pairwise)) * step
+      ylim_vals[2] <- max(pairwise$y.position) + step * 0.5
+    }
+  }
+
+  group_n <- table(df$Group)
+
+  p <- ggplot(df, aes(x = Group, y = Score, fill = Group)) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.8, linewidth = 0.7) +
+    coord_cartesian(ylim = ylim_vals) +
+    theme_bw() +
+    theme(
+      panel.grid   = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.2),
+      axis.title   = element_text(face = "bold", size = 13),
+      axis.text    = element_text(face = "bold", size = 11)
+    ) +
+    NoLegend() +
+    scale_x_discrete(labels = function(l) paste0(l, "\n(n=", group_n[l], ")")) +
+    labs(x = NULL, y = paste0(method, " score"))
+
+  if (add_pairwise_brackets && !is.null(pairwise) && nrow(pairwise) > 0) {
+    p <- p + ggpubr::stat_pvalue_manual(
+      pairwise, label = "p.label", tip.length = 0.01,
+      color = "black", fontface = "bold", bracket.size = 0.6
+    )
+  }
+
+  p
+}
+```
+
+Gene sets under test, beyond BH4 -- add/remove names here to change what
+the loops below produce; each just needs `<name>_GSVA`/`<name>_ssGSEA`/
+`<name>_UCell` columns to already exist on `tcga_brca` (see
+`pathways_to_score`).
+
+```{r requested-gene-sets}
+requested_gene_sets <- c("Glutathione", "CoQ10", "Thioredoxin", "Peroxiredoxin")
+```
+
+```{r genesets-gsva-boxplot-by-ksgroup, fig.width=4, fig.height=3}
+for (gs in requested_gene_sets) {
+  print(.geneSetSinglePanel(tcga_brca, gs, "KS_Group", "KS tertile", method = "GSVA"))
+}
+```
+
+```{r genesets-ssgsea-boxplot-by-ksgroup, fig.width=4, fig.height=3}
+for (gs in requested_gene_sets) {
+  print(.geneSetSinglePanel(tcga_brca, gs, "KS_Group", "KS tertile", method = "ssGSEA"))
+}
+```
+
+```{r genesets-ucell-boxplot-by-ksgroup, fig.width=4, fig.height=3}
+for (gs in requested_gene_sets) {
+  print(.geneSetSinglePanel(tcga_brca, gs, "KS_Group", "KS tertile", method = "UCell"))
+}
+```
+
+## Gene-set score heatmap (no goi rows)
+
+Same simplification just applied to Atlas_05's `genesetscore-heatmap-fn`
+-- 7 gene-set-score rows only (`Epi.tum`/`Mes.tum`/`BH4`/`Glutathione`/
+`CoQ10`/`Thioredoxin`/`Peroxiredoxin`; `BH4.synth`/`BH4.recyc` and `goi`'s
+raw expression dropped), samples ordered by `EMT_KS_TumorSig`, z-scored
+per row, with `EMT_KS_TumorSig` as the only color bar. A more targeted
+view than the existing "Gene-set score heatmap" section above (9 rows +
+goi) -- not a replacement for it. One heatmap per scoring method, same
+`suffix`-driven function as before.
+
+```{r genesetscore-heatmap-requested-fn}
+.geneSetScoreHeatmapRequested <- function(object, suffix, title) {
+  score_set_order <- c("Epi.tum", "Mes.tum", "BH4",
+                        "Glutathione", "CoQ10", "Thioredoxin", "Peroxiredoxin")
+  score_cols_hm <- paste0(score_set_order, suffix)
+
+  ks_order  <- order(object@meta.data$EMT_KS_TumorSig)
+  ks_values <- object@meta.data$EMT_KS_TumorSig[ks_order]
+
+  score_mat <- t(as.matrix(FetchData(object, vars = score_cols_hm)))
+  score_mat <- score_mat[, ks_order]
+  rownames(score_mat) <- sub(suffix, "", rownames(score_mat))
+
+  combined_scaled <- t(scale(t(score_mat)))
+
+  ks_cols <- circlize::colorRamp2(c(min(ks_values), max(ks_values)), c("darkorange", "lightgreen"))
+
+  col_anno <- HeatmapAnnotation(
+    EMT_KS_TumorSig = ks_values,
+    col = list(EMT_KS_TumorSig = ks_cols)
+  )
+
+  Heatmap(combined_scaled,
+          name              = "z-score",
+          top_annotation    = col_anno,
+          cluster_columns   = FALSE,
+          cluster_rows      = FALSE,
+          show_column_names = FALSE,
+          column_title      = paste0(title, ", ordered by EMT_KS_TumorSig (Epi -> Mes)"),
+          row_title         = "Gene set score")
+}
+
+score_cols_hm_suffix_ssgsea <- "_ssGSEA"
+score_cols_hm_suffix_ucell  <- "_UCell"
+```
+
+```{r heatmap-gsva-requested, fig.width=11, fig.height=6}
+.geneSetScoreHeatmapRequested(tcga_brca, score_cols_hm_suffix_gsva, "TCGA BRCA (GSVA)")
+```
+
+```{r heatmap-ssgsea-requested, fig.width=11, fig.height=6}
+.geneSetScoreHeatmapRequested(tcga_brca, score_cols_hm_suffix_ssgsea, "TCGA BRCA (ssGSEA)")
+```
+
+```{r heatmap-ucell-requested, fig.width=11, fig.height=6}
+.geneSetScoreHeatmapRequested(tcga_brca, score_cols_hm_suffix_ucell, "TCGA BRCA (UCell)")
+```
+
+# write session info
+
+Capturing information about the R session helps document your work
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "TCGA_BRCA_EMT_GeneSet_Scoring_sessionInfo.txt")
+```
