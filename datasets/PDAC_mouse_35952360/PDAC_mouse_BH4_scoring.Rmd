@@ -90,7 +90,7 @@ df$score <- seu@meta.data[[paste0(bh4_full, "_UCellMedianMaxRank")]]
 
 # Create the single UMAP plot
 p_umap_ucellMMR <- ggplot(df, aes(UMAP_1, UMAP_2, color = score)) +
-  geom_point(size = 0.2, stroke = 0, shape = 16) +
+  geom_point(size = 0.8, stroke = 0, shape = 16) +
   scale_color_gradient(low = "grey90", high = "#CB181D", name = "Score", limits = c(0, 0.8), n.breaks = 3) +
   labs(
     title = sprintf("BH4 UCell score (maxRank = %d)", ucell_maxrank_custom),
