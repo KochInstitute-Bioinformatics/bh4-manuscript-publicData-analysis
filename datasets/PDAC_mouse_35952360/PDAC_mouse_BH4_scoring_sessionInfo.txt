@@ -1,0 +1,8 @@
+This file is a placeholder.
+
+PDAC_mouse_BH4_scoring.Rmd was split out of the monolithic tmp/WH_BH4pathway_final/src/Analysis_script.Rmd
+during the datasets/ reorg (2026-09-22) but has not yet been re-knit in the
+project's RStudio Server container. Real session info (R version, package
+versions) will only exist once someone opens this dataset's .Rproj on the
+cluster and knits PDAC_mouse_BH4_scoring.Rmd top-to-bottom -- at that point this file should be
+overwritten by the notebook's own "write session info" chunk.

@@ -1,0 +1,141 @@
+---
+title: "Whitney Henry - Bulk RNAseq Analysis - SKCM TCGA (Tsoi 2018, PMID 29657129) - BH4 Pathway Scoring Figures"
+author: "Evelyn Tong"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/22/2026"
+---
+
+Split out of the original monolithic `tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`
+("BH4 analysis script - Evelyn - 2026/09/16", Data4 section) during the
+`datasets/` reorg, into its own self-contained dataset directory/project.
+See `SKCM_TCGA_BH4_scoring_Methods.md` for the full methodology.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 6, fig.height = 4, dpi = 300
+)
+source("emt_code/bh4_pathway_shared_setup.R")
+```
+
+## parameter settings
+
+```{r}
+# figures/ + stats output for this dataset
+current.outputfolder <- "figures"
+# define where the input RDS file is
+data.path <- "TCGA_bulkRNAseq_skcm.rds"
+
+# define state categories and colors
+STATE_ORDER <- c("Melanocytic", "Transitory", "Neural crest-like", "Undifferentiated")
+state_color <- c("Melanocytic"       = "#4DAF4A",   # green  (C4)
+                 "Transitory"        = "#984EA3",   # purple (C3)
+                 "Neural crest-like" = "#E41A1C",   # red    (C2)
+                 "Undifferentiated"  = "#377EB8")   # blue   (C1)
+
+# ── Tissue Site -> point shape (second boxplot) ──
+tissue_shapes <- c("Primary Tumor"                             = 16,
+                   "Distant Metastasis"                        = 17,
+                   "Regional Lymph Node"                       = 15,
+                   "Regional Cutaneous or Subcutaneous Tissue" = 3)
+```
+
+## load data and processing
+
+```{r}
+seu <- readRDS(data.path)
+seu$Patient_ID <- gsub("TCGA-SKCM_", "", rownames(seu@meta.data))
+
+cat("  Dimensions:", dim(seu)[1], "genes x", dim(seu)[2], "cells\n")
+cat("  BH4 genes present:", sum(bh4_genes %in% rownames(seu)), "/", length(bh4_genes), "\n")
+
+seu <- NormalizeData(seu)
+```
+
+## define state based on 4-state trajectory from Tsoi 2018;PMID 29657129
+
+```{r}
+# read in the state definition from the paper (PMID: 29657129)
+state_assignment <- read_excel_allsheets("SKCM_Tsoi2018_suppTable_s4.xlsx")$`Table S4`
+colnames(state_assignment) <- state_assignment[1, ]
+state_assignment <- state_assignment[-1, ]
+state_assignment$Patient_ID <- sub("^([^-]+-[^-]+-[^-]+).*", "\\1", state_assignment$Sample)
+state_assignment <- state_assignment %>% group_by(Patient_ID) %>% slice_head(n = 1) %>% as.data.frame()
+rownames(state_assignment) <- paste0("TCGA-SKCM_", state_assignment$Patient_ID)
+
+seu <- AddMetaData(seu, metadata = state_assignment)
+```
+
+## calculate BH4 signature score (ssgsea)
+
+```{r ssgsea}
+# Expression matrix (genes x samples). Using the `data` layer; ssGSEA is rank-based
+# so this is invariant to the transform. If your object only has counts, that layer
+# is used as-is (still fine for ssGSEA ranks).
+expr <- as.matrix(GetAssayData(seu, assay = "RNA", layer = "data"))
+
+# Modern GSVA param-object API (matches BRCA_TCGA/BRCA_atlas_CellxGene_Chen):
+# GSVA >= 2.x removed the old gsva(matrix, sets, method = ...) call in favor
+# of building a Param object and passing that to gsva().
+ssgsea_param <- ssgseaParam(expr, bh4_sigs, normalize = TRUE)
+ssg <- gsva(ssgsea_param)
+ssg_t <- t(ssg)
+for (s in bh4_score_names)
+  seu@meta.data[[paste0(s, "_ssGSEA")]] <- ssg_t[rownames(seu@meta.data), s]
+```
+
+## plotting
+### Main 5g boxplot by BH4 score
+```{r}
+# Abbreviated x-axis labels so the four subtype breaks don't overlap.
+short_state <- function(v) {
+  v[v == "Undifferentiated"]  <- "Undiff"
+  v[v == "Neural crest-like"] <- "NCL"
+  v[v == "Transitory"]        <- "Transit"
+  v[v == "Melanocytic"]       <- "Melano"
+  v
+}
+# Use the updated Seurat object name
+md <- seu@meta.data
+
+# Only plot pathway scores (no individual genes)
+quantities <- bh4_score_names
+
+# Build long dataframe for the pathways
+box_long <- do.call(rbind, lapply(bh4_score_names, function(s) {
+  data.frame(
+    Quantity = s,
+    cancer_state = md$Subtype,
+    value = as.numeric(md[[paste0(s, "_ssGSEA")]]),
+    y_label = "ssGSEA score",
+    stringsAsFactors = FALSE
+  )
+}))
+
+# Apply abbreviations directly to the dataframe
+box_long$cancer_state <- short_state(box_long$cancer_state)
+# Apply abbreviations to the order and fill vectors to ensure make_boxplot_state matches perfectly
+short_levels <- short_state(STATE_ORDER)
+short_fills <- state_color
+names(short_fills) <- short_state(names(state_color))
+
+# (1) standard boxplots (using previously defined make_boxplot_state)
+make_boxplot_state(
+  box_long,
+  quantities,
+  title_str = "BH4 pathways by Tsoi subtype  |  ssGSEA",
+  out_pdf   = file.path(current.outputfolder, "5g_Boxplot_byCellState_BH4_score.pdf"),
+  levels    = short_levels,
+  fills     = short_fills
+)
+```
+
+## write session info
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "SKCM_TCGA_BH4_scoring_sessionInfo.txt")
+```

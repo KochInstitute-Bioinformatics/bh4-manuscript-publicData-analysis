@@ -1,0 +1,500 @@
+---
+title: "Whitney Henry - scRNAseq Analysis - Baugh et al. - BH4 Paper Final Figures"
+author: "Charlie Whittaker"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/8/2026"
+---
+
+This notebook distills `baugh_08_chakrobortyMethod.Rmd` down to only the steps needed to generate the three final manuscript figure panels, using the specific method/parameter choices locked in for the paper:
+
+- **EMT scoring method:** canonical Chakraborty/Bell KS method (`KSScore()`, tumor `Epi.tum`/`Mes.tum` signature). The alternative MLR-based scoring approach (`emt_code/MLR_EMT_Score.R`) is not used.
+- **Feature plot:** manual, clamped color range of `[-0.2, 0.2]` (RdBu diverging scale, ColorBrewer; out-of-range cells squished to the limit color).
+- **Box plot:** EMT KS score on the Y axis, condition (`Model`) on the X axis.
+- **Dot plot:** gene-level dot plot at the resolution-0.4 clustering, with the manuscript-requested cluster order.
+
+No QC/diagnostic chunks, alternate color scales/ranges, alternate clustering resolutions, or the by-condition dot plots are included here — see `baugh_08_chakrobortyMethod.Rmd` for that full exploratory context and derivation.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(future.globals.maxSize = 5e10)
+```
+
+```{r load-libraries}
+library(openxlsx)
+library(tidyverse)
+library(patchwork)
+library(Seurat)
+library(edgeR)
+library(ggpubr)
+```
+
+# Import annotated tumor object
+
+```{r import-tumor-object}
+singlet.integrated.tumor <- readRDS("singlet.integrated.tumor_chakrobortyMethod.rds")
+
+# ── Join split layers before extracting data (Seurat v5); resolution-independent ──
+singlet.integrated.tumor <- JoinLayers(singlet.integrated.tumor)
+```
+
+# Figure 1a: single-cell EMT KS score feature plot (clamped range [-0.2, 0.2])
+
+Single-cell KS scoring (`KSScore()` run per cell, using the same tumor signature) was computed once (2026-09-02) and cached to `singlet.integrated.tumor_chakrobortyMethod.rds` — that non-vectorized step is slow, so it isn't re-run here. **If the gene signature, the ortholog mapping, or the upstream annotated object changes, this cached file goes stale silently**; see `baugh_08_chakrobortyMethod.Rmd` for the (commented-out) computation chunks and re-run those before trusting this figure again.
+
+Using `split.by` alone does not guarantee a shared color scale: once a custom `scale_color_gradientn()` (RdBu palette) is layered on with `&` (needed to anchor the midpoint at 0 with a manual, clamped range), it replaces Seurat's own per-feature scale-sharing and each panel is free to pick its own colour limits from just its own cells. To force a genuinely shared scale, one `FeaturePlot` is built per condition with an identical, explicitly-limited scale, then combined with patchwork.
+
+```{r emt-score-feature-plot-rdbu, fig.width=9,fig.height=4}
+manual_limit <- 0.2
+
+n_capped_low  <- sum(singlet.integrated.tumor$EMT_KS_Score < -manual_limit, na.rm = TRUE)
+n_capped_high <- sum(singlet.integrated.tumor$EMT_KS_Score >  manual_limit, na.rm = TRUE)
+n_total       <- sum(!is.na(singlet.integrated.tumor$EMT_KS_Score))
+
+cat(sprintf(
+  "Manual range [-%s, %s]: %d cells capped below (%.2f%%), %d cells capped above (%.2f%%), %d/%d total capped\n",
+  manual_limit, manual_limit,
+  n_capped_low,  100 * n_capped_low  / n_total,
+  n_capped_high, 100 * n_capped_high / n_total,
+  n_capped_low + n_capped_high, n_total
+))
+
+# ── Manual, clamped color scale: RdBu (ColorBrewer), out-of-range cells squished to the limit color ──
+my_colors <- rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))
+
+shared_scale_rdbu <- scale_color_gradientn(
+  colors = my_colors,
+  limits = c(-manual_limit, manual_limit),
+  oob    = scales::squish
+)
+
+# ── One FeaturePlot per condition (avoids split.by's independent scaling) ────
+p_NT25_rdbu <- FeaturePlot(
+  subset(singlet.integrated.tumor, Model == "NT2.5"),
+  features  = "EMT_KS_Score",
+  reduction = "umap.cca.new",
+  pt.size   = 0.5,
+  order     = TRUE
+) + shared_scale_rdbu + ggtitle("NT2.5")
+
+p_LM_rdbu <- FeaturePlot(
+  subset(singlet.integrated.tumor, Model == "NT2.5_LM"),
+  features  = "EMT_KS_Score",
+  reduction = "umap.cca.new",
+  pt.size   = 0.5,
+  order     = TRUE
+) + shared_scale_rdbu + ggtitle("NT2.5_LM")
+
+# ── Combine with a single collected legend ────────────────────────────────────
+p_ks_feature_rdbu <- (p_NT25_rdbu | p_LM_rdbu) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+p_ks_feature_rdbu
+ggsave("figures/Fig1a_EMT_KS_Score_FeaturePlot_chakroborty_RdBu.svg", p_ks_feature_rdbu, width = 9, height = 4, dpi = 300)
+```
+
+# EMT KS score (canonical Chakraborty method)
+
+## Import the canonical Chakraborty KS scoring code
+
+```{r source-chakraborty-ks-code}
+source("emt_code/Chakraborty_et_al_KS_code_vCAW.R")
+```
+
+## Tumor EMT gene signature (canonical signature file)
+
+```{r tumor-epi-mes-gene-sets}
+emt.tumor <- read.xlsx("emt_code/EM_gene_signature_tumor_KS.xlsx", colNames = FALSE) %>%
+  dplyr::rename(gene = X1, group = X2)
+
+Epi.tum <- emt.tumor$gene[emt.tumor$group == "Epi"]
+Mes.tum <- emt.tumor$gene[emt.tumor$group == "Mes"]
+
+cat("Epi.tum:", length(Epi.tum), " Mes.tum:", length(Mes.tum), "\n")
+```
+
+## Map tumor signature to mouse
+
+```{r import-mouse-human-orthologs}
+MoHu.mapping <- read.xlsx("emt_code/Mouse_Human_Orthologs_OnetoOne.xlsx")
+```
+
+```{r translate-tumor-sig-to-mouse}
+# Map Epi human genes -> mouse symbols
+Epi_mouse <- MoHu.mapping$Mouse_Sym[MoHu.mapping$HumanSym %in% Epi.tum]
+Epi_mouse <- unique(Epi_mouse[!is.na(Epi_mouse)])
+
+# Map Mes human genes -> mouse symbols
+Mes_mouse <- MoHu.mapping$Mouse_Sym[MoHu.mapping$HumanSym %in% Mes.tum]
+Mes_mouse <- unique(Mes_mouse[!is.na(Mes_mouse)])
+
+# Report on mapping success
+cat("Epi:", length(Epi_mouse), "of", length(Epi.tum), "mapped\n")
+cat("Mes:", length(Mes_mouse), "of", length(Mes.tum), "mapped\n")
+```
+
+## Write a mouse-mapped signature file for the canonical KSScore()
+
+The canonical `KSScore()` reads its gene lists from the two-column, no-header xlsx file pointed to by the global `KSScore.EMTSignature.file`, rather than taking them as function arguments — since this dataset is mouse, that file needs to hold the ortholog-mapped mouse symbols.
+
+```{r write-mouse-ks-signature}
+mouse_sig <- data.frame(
+  gene  = c(Epi_mouse, Mes_mouse),
+  group = c(rep("Epi", length(Epi_mouse)), rep("Mes", length(Mes_mouse)))
+)
+
+# `KSScore()` reads this global at call time; the mouse-mapped file was already
+# generated once (see below, commented out) and is reused here.
+KSScore.EMTSignature.file <- "emt_code/EM_gene_signature_tumor_mouse_KS.xlsx"
+# write.xlsx(mouse_sig, KSScore.EMTSignature.file, colNames = FALSE)
+```
+
+## KS score by condition (pseudobulk by replicate)
+
+### Build replicate-level pseudobulk
+
+```{r pseudobulk-replicate-counts}
+# ── 1. Get ordered list of replicates ─────────────────────────────────────────
+sample_order <- singlet.integrated.tumor@meta.data %>%
+  dplyr::select(orig.ident, Model) %>%
+  dplyr::distinct() %>%
+  dplyr::arrange(Model, orig.ident) %>%
+  dplyr::pull(orig.ident)
+
+sample_order
+# "NT2.5_V1" "NT2.5_V2" "NT2.5_V3" "NT2.5_V4"
+# "NT2.5_LM_V1" "NT2.5_LM_V2" "NT2.5_LM_V3" "NT2.5_LM_V4"
+
+# ── 2. Pseudobulk: SUM of raw counts per orig.ident ───────────────────────────
+counts_data <- GetAssayData(singlet.integrated.tumor, assay = "RNA", layer = "counts")
+metadata     <- singlet.integrated.tumor@meta.data
+
+pseudobulk_counts <- data.frame(row.names = rownames(counts_data))
+
+for (s in sample_order) {
+  cells_in_group <- rownames(metadata[metadata$orig.ident == s, ])
+
+  bulk_counts <- Matrix::rowSums(counts_data[, cells_in_group])
+  pseudobulk_counts[[s]] <- bulk_counts
+}
+
+dim(pseudobulk_counts)
+# 19662 genes × 8 pseudobulk samples (one per replicate)
+```
+
+```{r pseudobulk-replicate-logcpm}
+# Convert to DGEList and TMM-normalise → log-CPM
+dge <- DGEList(counts = as.matrix(pseudobulk_counts))
+dge <- calcNormFactors(dge, method = "TMM")
+
+logcpm_matrix <- edgeR::cpm(dge, log = TRUE, prior.count = 1)
+```
+
+### Calculate KS score by replicate
+
+```{r ks-score-pseudobulk-replicate}
+emt.KSscore <- KSScore(logcpm_matrix, gseID = "myExp_chakroborty", outDirectory = "./")
+```
+
+# Figure 1b: EMT KS score box plot by condition
+
+```{r boxplot-ks-score-by-condition, fig.width=5,fig.height=5}
+# ── 1. Convert named vector to a tidy data frame ──────────────────────────────
+ks_df <- data.frame(
+  sample = names(emt.KSscore),
+  score  = as.numeric(emt.KSscore)
+) %>%
+  mutate(
+    Model = ifelse(grepl("LM", sample), "NT2.5_LM", "NT2.5")
+  )
+
+head(ks_df)
+
+# ── 2. Plot: KS score on Y, condition on X ───────────────────────────────────
+p_ks_box <- ggplot(ks_df, aes(x = Model, y = score, fill = Model)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    position      = position_dodge(width = 0.8),
+    alpha         = 0.6,
+    width         = 0.6
+  ) +
+  geom_point(
+    aes(colour = Model),
+    position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.8),
+    size  = 2.5,
+    alpha = 0.9
+  ) +
+  scale_fill_manual(values   = c("NT2.5" = "#4DAFFF", "NT2.5_LM" = "#FF6B6B")) +
+  scale_colour_manual(values = c("NT2.5" = "#1565C0", "NT2.5_LM" = "#B71C1C")) +
+  labs(
+    x      = "Model",
+    y      = "EMT KS Score",
+    title  = "EMT Score by KS Method",
+    fill   = "Model",
+    colour = "Model"
+  ) +
+  stat_compare_means(
+    comparisons = list(c("NT2.5", "NT2.5_LM")),
+    method      = "t.test",
+    label       = "p.format"
+  ) +   # Welch's t-test (unequal variance, the t.test() default); drawn as a bracket via ggsignif
+  theme_bw(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    legend.position    = "right"
+  )
+
+p_ks_box
+ggsave("figures/Fig1b_EMT_KS_Score_byCondition_boxplot_chakroborty.svg", p_ks_box, width = 5, height = 5, dpi = 300)
+```
+
+# Figure 1c: gene-level dot plot (resolution 0.4, manuscript cluster order)
+
+## Gene sets
+
+```{r gene-sets-final}
+emt_tf <- c("Snai1", "Zeb1", "Vim")
+stemness_markers <- c("Cd44", "Sox9", "Cd24a", "Itga6", "Trp63")
+epithelial_markers <- c("Cdh1", "Epcam", "Krt7", "Itgb4", "Krt8", "Krt14")
+```
+
+## Prep data
+
+```{r mean-pct-expr-by-mod-clust}
+# ── Build mean expression and pct expressing for Model x cluster, for one resolution ──
+expr_data <- GetAssayData(singlet.integrated.tumor, assay = "RNA", layer = "data")
+metadata  <- singlet.integrated.tumor@meta.data
+
+compute_mod_clust_expr <- function(res_col) {
+  mod_clust <- paste(metadata$Model, metadata[[res_col]], sep = "_")
+
+  # Order: numerically by cluster, then alphabetically by Model
+  mod_clust_order <- data.frame(Model = metadata$Model, cluster = metadata[[res_col]], mod_clust = mod_clust) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(as.numeric(as.character(cluster)), Model) %>%
+    dplyr::pull(mod_clust)
+  # e.g. "NT2.5_0"    "NT2.5_LM_0" "NT2.5_1"    "NT2.5_LM_1" ...
+
+  expr_by_mod_clust <- data.frame(row.names = rownames(expr_data))
+  pct_by_mod_clust  <- data.frame(row.names = rownames(expr_data))
+
+  for (mc in mod_clust_order) {
+    cells_in_group <- rownames(metadata)[mod_clust == mc]
+
+    expr_by_mod_clust[[mc]] <- round(Matrix::rowMeans(expr_data[, cells_in_group]), 3)
+    pct_by_mod_clust[[mc]]  <- round(Matrix::rowMeans(expr_data[, cells_in_group] > 0) * 100, 1)
+  }
+
+  colnames(expr_by_mod_clust) <- paste0(colnames(expr_by_mod_clust), ".meanExp")
+  colnames(pct_by_mod_clust)  <- paste0(colnames(pct_by_mod_clust),  ".pctExp")
+
+  combined_data_mod_clust <- expr_by_mod_clust %>%
+    rownames_to_column(var = "gene") %>%
+    left_join(pct_by_mod_clust %>% rownames_to_column(var = "gene"), by = "gene")
+
+  list(combined_data = combined_data_mod_clust, mod_clust_order = mod_clust_order)
+}
+```
+
+```{r gene-groups-cluster-plot}
+# ── 0. Gene group definitions ─────────────────────────────────────────────────
+gene_group_vec <- c(
+  setNames(rep("EMT TF",     length(emt_tf)),             emt_tf),
+  setNames(rep("Stemness",   length(stemness_markers)),   stemness_markers),
+  setNames(rep("Epithelial", length(epithelial_markers)), epithelial_markers)
+)
+
+gene_order   <- names(gene_group_vec)   # preserves group order
+group_colors <- c("EMT TF" = "#1f77b4", "Stemness" = "yellow", "Epithelial" = "#ff7f0e")
+```
+
+```{r dot-long-cluster-zscore}
+# ── Build the long-format, z-scored dot-plot dataframe for one resolution ────────
+# Cluster labels (e.g. C0-C4 at res 0.1 vs C0-C9 at res 0.4) are derived from
+# whatever cluster IDs are actually present, rather than hardcoded.
+build_cluster_dot_long <- function(combined_data, mod_clust_order) {
+  dot_data <- combined_data %>% dplyr::filter(gene %in% gene_order)
+
+  missing <- setdiff(gene_order, dot_data$gene)
+  if (length(missing) > 0) message("Genes not found in dataset: ", paste(missing, collapse = ", "))
+
+  meanExp_cols <- paste0(mod_clust_order, ".meanExp")
+  pctExp_cols  <- paste0(mod_clust_order, ".pctExp")
+
+  clust_levels <- paste0("C", sort(unique(
+    as.integer(gsub(".*_(\\d+)$", "\\1", mod_clust_order))
+  )))
+
+  dot_long <- dot_data %>%
+    dplyr::select(gene, all_of(c(meanExp_cols, pctExp_cols))) %>%
+    pivot_longer(-gene, names_to = "col_name", values_to = "value") %>%
+    mutate(
+      metric    = ifelse(grepl("\\.meanExp$", col_name), "meanExp", "pctExp"),
+      mod_clust = gsub("\\.(meanExp|pctExp)$", "", col_name)
+    ) %>%
+    dplyr::select(-col_name) %>%
+    pivot_wider(names_from = metric, values_from = value) %>%
+    mutate(
+      Model         = factor(
+        ifelse(grepl("NT2.5_LM", mod_clust), "NT2.5_LM", "NT2.5"),
+        levels = c("NT2.5", "NT2.5_LM")
+      ),
+      Cluster       = as.integer(gsub(".*_(\\d+)$", "\\1", mod_clust)),
+      Cluster_label = factor(paste0("C", Cluster), levels = clust_levels),
+      category      = factor(gene_group_vec[gene],
+                             levels = c("EMT TF", "Stemness", "Epithelial"))
+    )
+
+  # ── Compute per-gene z-score of meanExp, then set colour limit ────────────────
+  dot_long <- dot_long %>%
+    group_by(gene) %>%
+    mutate(zscore = as.numeric(scale(meanExp))) %>%
+    ungroup()
+
+  list(dot_long = dot_long, clust_levels = clust_levels)
+}
+```
+
+## Generate the plot
+
+```{r marker-dot-plot-by-cluster-function}
+# ── Build, print, and save the cluster-level dot plot for one resolution ────────
+make_cluster_dotplot <- function(res_col, cluster_order = NULL) {
+  expr_prep <- compute_mod_clust_expr(res_col)
+  long_prep <- build_cluster_dot_long(expr_prep$combined_data, expr_prep$mod_clust_order)
+  dot_long     <- long_prep$dot_long
+  clust_levels <- long_prep$clust_levels
+
+  lim <- max(abs(dot_long$zscore), na.rm = TRUE)
+  lim <- ifelse(lim == 0, 1, lim)
+
+  # ggplot y-axis: first factor level = bottom, last level = top.
+  # `cluster_order`, when given, is the desired TOP-to-BOTTOM display order
+  # (e.g. c("C1","C2",...)) -- reverse it for factor levels. Default (NULL)
+  # is ascending numeric order with C0 on top, regardless of cluster count.
+  if (!is.null(cluster_order)) {
+    stopifnot(setequal(cluster_order, clust_levels))
+    display_order <- cluster_order
+  } else {
+    display_order <- clust_levels
+  }
+  dot_long <- dot_long %>%
+    mutate(Cluster_label = factor(as.character(Cluster_label), levels = rev(display_order)))
+
+  # ── Vertical separator positions between gene groups ──────────────────────────
+  gene_boundaries <- c(
+    length(emt_tf) + 0.5,
+    length(emt_tf) + length(stemness_markers) + 0.5
+  )
+
+  # ── Main dotplot ──────────────────────────────────────────────────────────────
+  p_main <- ggplot(
+      dot_long,
+      aes(x = factor(gene, levels = gene_order),
+          y = Cluster_label)
+    ) +
+    geom_vline(
+      xintercept = gene_boundaries,
+      linetype   = "dashed",
+      color      = "grey70",
+      linewidth  = 0.4
+    ) +
+    geom_point(aes(size = pctExp, color = zscore)) +
+    facet_grid(
+      rows     = vars(Model),
+      labeller = labeller(Model = c(
+        "NT2.5"    = "NT2.5",
+        "NT2.5_LM" = "NT2.5_LM"
+      ))
+    ) +
+    scale_color_gradientn(
+      colors = c("#2F6FB2", "#9FC3DF", "#F4EFE6", "#F28E5C", "#E84A3A"),
+      values = scales::rescale(c(-lim, -lim/3, 0, lim/3, lim)),
+      limits = c(-lim, lim),
+      name   = "Z-score\nmean expr."
+    ) +
+    scale_size_continuous(
+      name   = "% expressed",
+      range  = c(0.5, 7),
+      breaks = c(10, 25, 50, 75)
+    ) +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x     = element_blank(),
+      axis.ticks.x    = element_blank(),
+      axis.title      = element_blank(),
+      axis.text.y     = element_text(size = 9),
+      panel.grid      = element_blank(),
+      strip.text.y    = element_text(size = 9, face = "bold", angle = 0),
+      panel.spacing.y = unit(0, "pt"),          # panels touch → borders share one edge
+      panel.border    = element_rect(colour = "grey40", fill = NA, linewidth = 0.6),
+      legend.position = "right"
+    )
+
+  # ── Gene group annotation bar ─────────────────────────────────────────────────
+  anno_bar <- data.frame(
+    gene     = factor(gene_order, levels = gene_order),
+    category = factor(
+      gene_group_vec[gene_order],
+      levels = c("EMT TF", "Stemness", "Epithelial")   # ← keep original internal names
+    ),
+    y = 1
+  )
+
+  p_anno <- ggplot(anno_bar, aes(x = gene, y = y, fill = category)) +
+    geom_tile(color = NA, height = 0.5) +
+    scale_fill_manual(
+      values = group_colors,                             # still keyed to original names
+      labels = c(                                        # adjust legend text
+        "EMT TF"     = "EMT/mesenchymal",
+        "Stemness"   = "Plasticity/progenitor",
+        "Epithelial" = "Epithelial/basal"
+      ),
+      name  = "Gene Group",
+      guide = guide_legend(title.position = "top", ncol = 1)
+    ) +
+    scale_y_continuous(limits = c(0.5, 1.5)) +
+    theme_minimal() +
+    theme(
+      axis.text.x     = element_text(angle = 45, hjust = 1, face = "italic", size = 9),
+      axis.text.y     = element_blank(),
+      axis.ticks      = element_blank(),
+      axis.title      = element_blank(),
+      panel.grid      = element_blank(),
+      plot.margin     = margin(0, 0, 0, 0),
+      legend.position = "right"
+    )
+
+  # ── Combine ───────────────────────────────────────────────────────────────────
+  res_label <- sub("RNA_snn_res\\.", "", res_col)
+  fig <- p_main / p_anno +
+    plot_layout(heights = c(8, 1), guides = "collect") +
+    plot_annotation(title = paste("Cluster resolution:", res_label)) &
+    theme(legend.position = "right")
+
+  res_suffix <- sub("RNA_snn_res\\.", "res", res_col)
+  ggsave(paste0("figures/Fig1c_EMT_Stem_Epi_Dotplot_byCluster_", res_suffix, ".svg"), fig, width = 9, height = 7, dpi = 300)
+
+  fig
+}
+```
+
+Manuscript figure: resolution-0.4 clustering, clusters reordered on the Y axis (top-to-bottom) as `1, 2, 3, 8, 0, 7, 6, 9, 5, 4` per reviewer feedback.
+
+```{r marker-dot-plot-by-cluster-res0-4, fig.width=9,fig.height=7}
+cluster_order_res0_4 <- paste0("C", c(1, 2, 3, 8, 0, 7, 6, 9, 5, 4))
+
+fig_cluster_dotplot_final <- make_cluster_dotplot("RNA_snn_res.0.4", cluster_order = cluster_order_res0_4)
+fig_cluster_dotplot_final
+```
+
+# Write session info
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "baugh_BH4paper_figures_sessionInfo.txt")
+```

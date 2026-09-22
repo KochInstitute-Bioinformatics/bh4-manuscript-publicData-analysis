@@ -1,0 +1,4 @@
+"Signature","Spearman_rho","p_value","p_value_BH","significant"
+"BH4_denovo_synthesis",-0.0694596630656771,0.121588461184046,0.121588461184046,FALSE
+"BH4_recycling_regeneration",-0.595983997278696,0,0,TRUE
+"BH4_denovo_synthesis_recycling_regeneration",-0.443630418578788,0,0,TRUE

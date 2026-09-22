@@ -1,0 +1,222 @@
+---
+title: "Whitney Henry - Microarray Analysis - Neuroblastoma cell lines (PMID 30948783, GSE90803/GSE116890) - GCH1 Expression Figures"
+author: "Evelyn Tong"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/22/2026"
+---
+
+Split out of the original monolithic `tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`
+("BH4 analysis script - Evelyn - 2026/09/16", Data7 section) during the
+`datasets/` reorg, into its own self-contained dataset directory/project.
+See `NB_cellline_GCH1_expression_Methods.md` for the full methodology.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 6, fig.height = 4, dpi = 300
+)
+source("emt_code/bh4_pathway_shared_setup.R")
+```
+
+## parameter settings
+```{r}
+# figures/ output for this dataset
+current.outputfolder <- "figures"
+# define where the input RDS files are
+d90803.data.path <- "GSE90803.rds"
+d116890.data.path <- "GSE116890.rds"
+probe.path <- "probe_info.rds"
+
+# define state categories and colors
+adrn_color <- "#0279EE"   # blue
+mes_color  <- "#FF9400"   # orange
+off_color  <- "#0279EE"   # blue (OFF = uninduced, ADRN-like)
+on_color   <- "#FF9400"   # orange (ON = NOTCH3-IC, MES-like)
+```
+## load data and processing
+```{r}
+# data platform:** Affymetrix HG-U133 Plus 2.0 (GPL570), MAS5.0 log2
+#  ── Load probe data ────────────────────────────────────────────────────────────────
+probe_info <- readRDS(probe.path)
+probeset_map <- probe_info$probeset_map
+bh4_probesets     <- probe_info$bh4_probesets
+control_probesets <- probe_info$control_probesets
+all_probesets     <- c(bh4_probesets, control_probesets)
+
+# ── Load GSE90803 data ────────────────────────────────────────────────────────────────
+d90803 <- readRDS(d90803.data.path)
+raw_90803  <- d90803$raw_matrix
+meta_90803 <- d90803$sample_metadata
+
+## Extract 12 genes using probeset mapping
+expr_90803 <- extract_affy_genes(raw_90803, probeset_map, all_probesets, meta_90803)
+expr_90803 <- expr_90803 %>%
+  left_join(meta_90803, by = "GSM") %>%
+  mutate(
+    Gene = factor(Gene, levels = names(all_probesets)),
+    CellType = factor(CellType, levels = c("ADRN", "MES"))
+  )
+
+# ── Load GSE116890 data ────────────────────────────────────────────────────────────────
+d116890 <- readRDS(d116890.data.path)
+raw_116890  <- d116890$raw_matrix
+meta_116890 <- d116890$sample_metadata
+
+## Extract 12 genes using probeset mapping
+expr_116890 <- extract_affy_genes(raw_116890, probeset_map, all_probesets, meta_116890)
+expr_116890 <- expr_116890 %>%
+  left_join(meta_116890, by = "GSM") %>%
+  mutate(
+    Gene = factor(Gene, levels = names(all_probesets)),
+    Condition = factor(Condition, levels = c("OFF", "ON")),
+    Days_num = as.numeric(Days)
+  )
+```
+## plotting
+### Extended 4a,4b barplot for GCH1 expression by cell line pairs
+```{r}
+# ── Map labels and define explicit x-axis positions for exact gaps ───────────
+label_map <- data.frame(
+  Sample = c("SH-SY5Y", "SH-EP2", "691B", "691T", "700B_CD133-", "700B_CD133+", "717T", "717T-MES"),
+  label  = c("SH-SY5Y\nADRN", "SH-EP2\nMES", "691_ADRN", "691_MES", "700_ADRN", "700_MES", "717_ADRN", "717_MES"),
+  PlotGroup = c("SH", "SH", "3_Pairs", "3_Pairs", "3_Pairs", "3_Pairs", "3_Pairs", "3_Pairs"),
+  # For SH: positions 1 & 2. For 3_Pairs: positions 1, 2, 4, 5, 7, 8 (skipping 3 & 6 for gaps)
+  x_pos  = c(1, 2, 1, 2, 4, 5, 7, 8)
+)
+
+plot_df <- expr_90803 %>%
+  filter(Gene == "GCH1") %>%
+  left_join(label_map, by = "Sample") %>%
+  filter(!is.na(label))
+
+# ── Plot 1: 3 Pairs with internal gaps (Spans from x=0.4 to 8.6) ─────────────
+df_3pairs <- plot_df %>% filter(PlotGroup == "3_Pairs")
+
+p1 <- ggplot(df_3pairs, aes(x = x_pos, y = MAS5_log2, fill = CellType)) +
+  geom_col(width = 0.8, alpha = 0.85, color = "black", linewidth = 0.5) +
+  scale_fill_manual(values = c("ADRN" = adrn_color, "MES" = mes_color)) +
+  scale_x_continuous(
+    breaks = c(1, 2, 4, 5, 7, 8),
+    labels = c("691_ADRN", "691_MES", "700_ADRN", "700_MES", "717_ADRN", "717_MES"),
+    limits = c(0.4, 8.6)
+  ) +
+  labs(title = "GCH1 expression", x = NULL, y = "log2 (MAS5.0)") +
+  figure_theme +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+# ── Plot 2: 1 Pair (Spans from x=0.4 to 2.6) ─────────────────────────────────
+df_sh <- plot_df %>% filter(PlotGroup == "SH")
+
+p2 <- ggplot(df_sh, aes(x = x_pos, y = MAS5_log2, fill = CellType)) +
+  geom_col(width = 0.8, alpha = 0.85, color = "black", linewidth = 0.5) +
+  scale_fill_manual(values = c("ADRN" = adrn_color, "MES" = mes_color)) +
+  scale_x_continuous(
+    breaks = c(1, 2),
+    labels = c("SH-SY5Y\nADRN", "SH-EP2\nMES"),
+    limits = c(0.4, 2.6)
+  ) +
+  labs(title = "GCH1 expression", x = NULL, y = "log2 (MAS5.0)") +
+  figure_theme +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+# ── Combine with patchwork ───────────────────────────────────────────────────
+# The widths ratio (8.2 : 2.2) perfectly matches the numeric axis limits mapped above,
+# guaranteeing the physical bar widths and gap spaces remain 100% mathematically identical.
+final_p <- p1 + p2 +
+  plot_layout(widths = c(8.2, 2.2)) +
+  plot_annotation(
+    title = "GSE90803",
+    theme = theme(plot.title = element_text(face = "bold", size = 6, hjust = 0.5))
+  )
+
+# ── Save Output (PDF + SVG) ──────────────────────────────────────────────────
+out_file <- file.path(current.outputfolder, "Extended_4ab_barplot_GCH1_GeneExpression.pdf")
+ggsave(out_file, final_p, width = 3.5, height = 2, bg = "white")
+ggsave(sub("\\.pdf$", ".svg", out_file), final_p, width = 3.5, height = 2, bg = "white")
+
+final_p
+```
+### Extended 4c lineplot for GCH1 expression by NOTCH-IC
+```{r}
+# ── Map Days to evenly-spaced x-axis positions ───────────────────────────────
+x_map <- data.frame(Days_num = c(0, 1, 7, 14, 21), x_pos = c(1, 2, 3, 4, 5))
+expr_116890 <- expr_116890 %>% left_join(x_map, by = "Days_num")
+
+# ── Subset and prepare data specifically for GCH1 ────────────────────────────
+gdf <- expr_116890 %>% filter(Gene == "GCH1")
+
+# Extract Day 0 baseline
+d0_val  <- gdf %>% filter(Hours == 0) %>% pull(MAS5_log2)
+d0_x    <- gdf %>% filter(Hours == 0) %>% pull(x_pos)
+d0_data <- data.frame(x_pos = d0_x, MAS5_log2 = d0_val)
+
+# Extract ON condition (induced) and prepend Day 0 baseline to connect the line
+on_data <- gdf %>% filter(Condition == "ON" & Days_num > 0) %>% select(x_pos, MAS5_log2)
+on_data <- rbind(data.frame(x_pos = d0_x, MAS5_log2 = d0_val), on_data)
+
+# Extract OFF condition (uninduced)
+off_data <- gdf %>% filter(Condition == "OFF") %>% select(x_pos, MAS5_log2)
+
+# ── Create the line plot with native legend ──────────────────────────────────
+y_lim <- c(4, 13)
+
+p_gch1 <- ggplot() +
+    # OFF Condition
+    geom_line(data = off_data, aes(x = x_pos, y = MAS5_log2, color = "OFF"), group = 1, linewidth = 0.8) +
+    geom_point(data = off_data %>% filter(x_pos > d0_x), aes(x = x_pos, y = MAS5_log2, color = "OFF"), size = 2) +
+
+    # ON Condition
+    geom_line(data = on_data, aes(x = x_pos, y = MAS5_log2, color = "ON"), group = 1, linewidth = 0.8) +
+    geom_point(data = on_data %>% filter(x_pos > d0_x), aes(x = x_pos, y = MAS5_log2, color = "ON"), size = 2) +
+
+    # Day 0 Baseline
+    geom_point(data = d0_data, aes(x = x_pos, y = MAS5_log2, color = "D0"), size = 2) +
+
+    # Scales & Native Legend Setup
+    scale_x_continuous(breaks = c(1, 2, 3, 4, 5), labels = c("0d", "1d", "7d", "14d", "21d")) +
+    scale_color_manual(
+        name = NULL, # Removes the legend title
+        values = c("D0" = "black", "OFF" = off_color, "ON" = on_color),
+        labels = c("D0" = "D0 (baseline)", "OFF" = "OFF (uninduced)", "ON" = "ON (NOTCH3-IC)")
+    ) +
+    coord_cartesian(ylim = y_lim) +
+
+    # Titles and Theme
+    labs(
+        title = "NOTCH3-IC Time-Course (GSE116890)",
+        subtitle = "GCH1 Expression",
+        x = NULL,
+        y = "log2 (MAS5.0)"
+    ) +
+    figure_theme +
+    theme(
+        legend.position = "right",
+        plot.title = element_text(face = "bold", size = 6, hjust = 0.5),
+        plot.subtitle = element_text(face = "bold", size = 6, hjust = 0.5)
+    )
+
+# ── Save Output (PDF + SVG) ──────────────────────────────────────────────────
+out_file <- file.path(current.outputfolder, "Extended_4c_lineplot_GCH1_GeneExpression.pdf")
+ggsave(out_file, p_gch1, width = 3, height = 2, bg = "white")
+ggsave(sub("\\.pdf$", ".svg", out_file), p_gch1, width = 3, height = 2, bg = "white")
+
+p_gch1
+```
+
+## write session info
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "NB_cellline_GCH1_expression_sessionInfo.txt")
+```

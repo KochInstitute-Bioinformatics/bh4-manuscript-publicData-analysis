@@ -1,0 +1,166 @@
+---
+title: "Whitney Henry - Bulk RNAseq Analysis - Neuroblastoma SEQC (PMID 25150838, GSE62564) - BH4 vs MES-ADRN Correlation"
+author: "Evelyn Tong"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/22/2026"
+---
+
+Split out of the original monolithic `tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`
+("BH4 analysis script - Evelyn - 2026/09/16", Data5 section) during the
+`datasets/` reorg, into its own self-contained dataset directory/project.
+See `NB_SEQC_BH4_MESADRN_correlation_Methods.md` for the full methodology.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 6, fig.height = 4, dpi = 300
+)
+source("emt_code/bh4_pathway_shared_setup.R")
+```
+
+## parameter settings
+
+```{r}
+# figures/ + stats output for this dataset
+current.outputfolder <- "figures"
+# define where the input RDS file is
+data.path <- "GSE62564.rds"
+```
+
+## load data and processing
+
+```{r}
+seu <- readRDS(data.path)
+gene_seu  <- seu$gene_matrix
+clinical_seu <- seu$clinical_metadata
+
+cat("  Dimensions:", dim(gene_seu)[1], "genes x", dim(gene_seu)[2], "cells\n")
+cat("  BH4 genes present:", sum(bh4_genes %in% rownames(gene_seu)), "/", length(bh4_genes), "\n")
+```
+
+## calculate ADRN/MES and BH4 signature scores (ssgsea)
+
+```{r}
+mesadrn.signatures <- readxl::read_excel("28650485_Groningen_SuppTable2.xlsx", skip = 2, col_names = FALSE)
+colnames(mesadrn.signatures) <- c("gene", "state")
+pathways_to_score <- c(list(
+  MES     = mesadrn.signatures[mesadrn.signatures$state == "MES", "gene"]$gene,
+  ADRN = mesadrn.signatures[mesadrn.signatures$state == "ADRN", "gene"]$gene),
+  bh4_sigs)
+
+# Calculate normalized ssGSEA scores directly on the gene_seu matrix
+# (modern GSVA param-object API -- see BRCA_TCGA/SKCM_TCGA notebooks;
+# GSVA >= 2.x removed the old gsva(matrix, sets, method = ...) call)
+ssgsea_param <- ssgseaParam(as.matrix(gene_seu), pathways_to_score, normalize = TRUE)
+ssgsea_mat <- gsva(ssgsea_param)
+# Convert the resulting (pathway x sample) matrix to a dataframe
+scores_ssgsea <- as.data.frame(t(ssgsea_mat))
+
+# Add sample IDs and calculate the derived relative scores
+scores_ssgsea$sample_id <- rownames(scores_ssgsea)
+scores_ssgsea$ADRN_minus_MES <- scores_ssgsea$ADRN - scores_ssgsea$MES
+scores_ssgsea$MES_ADRN_score <- scores_ssgsea$ADRN_minus_MES * -1   # = MES - ADRN
+
+# Optional: Reorder columns for a clean output format
+scores_ssgsea <- scores_ssgsea[, c("sample_id", names(pathways_to_score), "ADRN_minus_MES", "MES_ADRN_score")]
+
+scores_ssgsea$BH4_score <- scores_ssgsea[[bh4_full]]
+```
+
+## run spearman correlation - BH4 Signatures vs MES-ADRN score
+
+```{r}
+# Calculate correlation for each signature in bh4_score_names
+corr_rows <- lapply(bh4_score_names, function(sig) {
+  ct <- suppressWarnings(
+    cor.test(scores_ssgsea$MES_ADRN_score, scores_ssgsea[[sig]], method = "spearman")
+  )
+
+  data.frame(
+    Signature = sig,
+    Spearman_rho = unname(ct$estimate),
+    p_value = ct$p.value,
+    stringsAsFactors = FALSE
+  )
+})
+
+# Combine into a single dataframe
+corr_df <- do.call(rbind, corr_rows)
+
+# Apply Benjamini-Hochberg (FDR) correction for multiple testing
+corr_df$p_value_BH <- p.adjust(corr_df$p_value, method = "BH")
+corr_df$significant <- corr_df$p_value_BH < 0.05
+
+# Save the statistics to a CSV file
+out_file <- "BH4_signatures_spearman_correlation_stats_ssgsea.csv"
+write.csv(corr_df, out_file, row.names = FALSE)
+```
+
+## plotting
+
+### Main 5h scatter plot
+
+```{r}
+on_color <- "#FF9400"
+# Create a list of the 3 scatter plots
+panels <- lapply(bh4_score_names, function(sig) {
+
+  # Extract correlation stats for this signature from the previously created corr_df
+  ct_row <- corr_df[corr_df$Signature == sig, ]
+  p_str  <- if (ct_row$p_value < 0.001) sprintf("p = %.2e", ct_row$p_value) else sprintf("p = %.3f", ct_row$p_value)
+  subtitle_str <- sprintf("rho = %.3f, %s", ct_row$Spearman_rho, p_str)
+
+  # Setup plotting dataframe
+  df_plot <- data.frame(
+    x = scores_ssgsea$MES_ADRN_score,
+    y = scores_ssgsea[[sig]]
+  )
+
+  # Calculate linear fit
+  fit <- lm(y ~ x, data = df_plot)
+  df_plot$fit <- predict(fit)
+
+  # Generate single plot
+  ggplot(df_plot, aes(x = x, y = y)) +
+    geom_point(size = 0.4, alpha = 0.4, color = "black") +
+    geom_line(aes(y = fit), color = on_color, linewidth = 0.5) +
+    labs(
+      title = sig,
+      subtitle = subtitle_str,
+      x = "MES-ADRN score",
+      y = "BH4 score"
+    ) +
+    figure_theme +
+    coord_fixed(ratio = diff(range(df_plot$x, na.rm = TRUE)) / diff(range(df_plot$y, na.rm = TRUE)))
+})
+
+# Combine the 3 panels into 1 row, 3 columns using patchwork
+p_scatter <- wrap_plots(panels, ncol = 3) +
+  plot_annotation(
+    title = sprintf("BH4 Signatures vs MES-ADRN Score (SEQC dataset, n=%d) | ssGSEA", nrow(scores_ssgsea)),
+    theme = theme(plot.title = element_text(face = "bold", size = 6, hjust = 0.5))
+  )
+
+# Save the figure (both PDF and SVG)
+out_file <- file.path(current.outputfolder, "5h_scatterplot_BH4vsMESADRN_score.pdf")
+pdf(out_file, width = 5, height = 2)  # Wider layout for 3 columns in 1 row
+print(p_scatter)
+dev.off()
+svg(sub("\\.pdf$", ".svg", out_file), width = 5, height = 2)
+print(p_scatter)
+dev.off()
+
+# Display in the RStudio session / notebook output (the pdf()/svg() device
+# blocks above only draw to their respective files, not the screen)
+print(p_scatter)
+```
+
+## write session info
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "NB_SEQC_BH4_MESADRN_correlation_sessionInfo.txt")
+```

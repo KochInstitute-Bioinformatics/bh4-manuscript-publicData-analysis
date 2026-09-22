@@ -17,28 +17,37 @@
 # of carrying ~150 binary package files in git.
 /R/
 
-# Raw GEO download for SUM149PT (Brown, Abdollahi, Wilkins et al. 2022,
-# Sci. Adv. 8, eabj8002; re-fetchable from the GSE172609 GEO accession
-# page -- the RNA-seq SubSeries of SuperSeries GSE172613;
-# nf-core_fetchngs.sh/ids.csv target a raw-read reprocessing path that the
-# current notebook doesn't actually use -- see README's Known gaps)
-SUM149PT/from_geo/
+# Raw GEO download for the SUM149PT cell-line dataset (Brown, Abdollahi,
+# Wilkins et al. 2022, Sci. Adv. 8, eabj8002; re-fetchable from the
+# GSE172609 GEO accession page -- the RNA-seq SubSeries of SuperSeries
+# GSE172613; nf-core_fetchngs.sh/ids.csv target a raw-read reprocessing
+# path that the current notebook doesn't actually use -- see README's
+# Known gaps)
+datasets/TNBC_cellline_SUM149PT_GSE172609/from_geo/
 
-# Per-dataset raw input data (self-contained under each dataset directory):
-# - Baugh/data/: raw 10x outs directories (GEO accession GSE261252; see
-#   Baugh/baugh_BH4paper_prep.Rmd's "Raw data" section) -- rename.sh is
-#   small provenance code, not data, so it's kept
-# - Chen/data/: CZ CELLxGENE h5ad, downloaded on demand by
-#   Chen/ChenAtlas_malignant_pseudobulk_prep.Rmd (re-fetchable from the URL
-#   in that notebook)
-# - TCGA/data/: Broad Firehose batch-corrected pan-cancer matrix + clinical
-#   metadata (original GDC/Firehose hosting pages are dead; provenance
-#   tracked via citation instead -- see TCGA_BRCA_prep.Rmd's "Raw data"
-#   section)
-Baugh/data/
-!Baugh/data/rename.sh
-Chen/data/
-TCGA/data/
+# Per-dataset raw/large input data (self-contained under each dataset
+# directory, one `data/` per dataset -- covers both the 4 below and every
+# dataset under datasets/):
+# - Baugh2024_GSE261252/data/: raw 10x outs directories (GEO accession
+#   GSE261252; see baugh_BH4paper_prep.Rmd's "Raw data" section) --
+#   rename.sh is small provenance code, not data, so it's kept
+# - BRCA_atlas_CellxGene_Chen/data/: CZ CELLxGENE h5ad, downloaded on
+#   demand by ChenAtlas_malignant_pseudobulk_prep.Rmd (re-fetchable from
+#   the URL in that notebook)
+# - BRCA_TCGA/data/: Broad Firehose batch-corrected pan-cancer matrix +
+#   clinical metadata (original GDC/Firehose hosting pages are dead;
+#   provenance tracked via citation instead -- see TCGA_BRCA_prep.Rmd's
+#   "Raw data" section)
+datasets/*/data/*
+!datasets/Baugh2024_GSE261252/data/rename.sh
+
+# Staging area + tarball built by pack_input_data.sh (mirrors every
+# gitignored data file above under one directory for distribution outside
+# git -- see README's "Large files / data availability" and
+# restore_input_data.sh). Never tracked -- same reasoning as the data
+# itself, just bundled.
+/input_data/
+/input_data.tar.gz
 
 # --- RStudio / R session state ---
 # These land in the project directory because the Singularity container's

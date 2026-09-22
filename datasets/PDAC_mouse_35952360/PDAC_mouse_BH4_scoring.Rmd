@@ -1,0 +1,201 @@
+---
+title: "Whitney Henry - scRNAseq Analysis - PDAC mouse (Pitter, PMID 35952360) - BH4 Pathway Scoring Figures"
+author: "Evelyn Tong"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/22/2026"
+---
+
+Split out of the original monolithic `tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`
+("BH4 analysis script - Evelyn - 2026/09/16", Data1 section) during the
+`datasets/` reorg, into its own self-contained dataset directory/project.
+See `PDAC_mouse_BH4_scoring_Methods.md` for the full methodology and a
+Known Gaps note (a pre-existing bug in the Extended 6a panel, carried over
+verbatim from the source script).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 6, fig.height = 4, dpi = 300
+)
+source("emt_code/bh4_pathway_shared_setup.R")
+```
+
+## parameter settings
+```{r}
+# figures/ + stats output for this dataset
+current.outputfolder <- "figures"
+# define where the input RDS file is
+data.path <- "pitter_bh4_seurat.rds"
+# define state categories and colors
+STATE_ORDER <- c("Luminal cells", "Basal cells", "Mesenchymal cells", "Other")
+state_color <- c("Luminal cells"     = "#334589",
+                 "Basal cells"       = "#ed9d2d",
+                 "Mesenchymal cells" = "#d95f02",
+                 "Other"             = "#C0C0C0")
+```
+## load data and processing
+```{r}
+seu <- readRDS(data.path) #
+seu$cell_state <- factor(as.character(seu@meta.data$cell_state), levels = STATE_ORDER)
+cat("  Dimensions:", dim(seu)[1], "genes x", dim(seu)[2], "cells\n")
+cat("  State counts:\n"); print(table(seu$cell_state, useNA = "ifany"))
+cat("  BH4 genes present:", sum(bh4_genes_mouse %in% rownames(seu)), "/", length(bh4_genes_mouse), "\n")
+
+seu <- NormalizeData(seu)
+
+# ── Dataset-customized UCell maxRank ─────────────────────────────────────────
+# Malignant compartment = cells used for plotting/correlation (non-"Other").
+if (!"nFeature_RNA" %in% colnames(seu@meta.data)) {
+  seu$nFeature_RNA <- Matrix::colSums(GetAssayData(seu, assay = "RNA", layer = "counts") > 0)
+}
+malignant_mask <- !is.na(seu$cell_state) & seu$cell_state != "Other"
+ucell_maxrank_custom <- as.integer(round(median(seu$nFeature_RNA[malignant_mask])))
+
+cat(sprintf(
+  "\n  >>> Custom UCell maxRank = median nFeature_RNA of malignant compartment\n"))
+cat(sprintf(
+  "      malignant cells (cell_state != 'Other'): n = %d\n", sum(malignant_mask)))
+cat(sprintf(
+  "      median nFeature_RNA (chosen maxRank)   : %d\n", ucell_maxrank_custom))
+```
+## calculate BH4 signature score
+```{r}
+# Run UCell, maxRank = dataset-customized maxRank (median nFeature of malignant)
+seu <- AddModuleScore_UCell(
+  seu,
+  features = bh4_sigs_mouse,
+  maxRank = ucell_maxrank_custom,
+  name = "_UCellMedianMaxRank",
+  ncores = 4
+)
+
+# Composite (full-pathway) scores for the summary / UMAP / heatmap
+seu$BH4_UCellMedianMaxRank <- seu@meta.data[[paste0(bh4_full, "_UCellMedianMaxRank")]]
+```
+
+## plotting
+### Main 5d - UMAP by BH4 score
+
+```{r}
+# Extract UMAP coordinates and just the bh4_full score
+umap_coords <- as.data.frame(Embeddings(seu, "umap"))[, 1:2]
+colnames(umap_coords) <- c("UMAP_1", "UMAP_2")
+umap_coords$cell_state <- seu$cell_state
+df <- umap_coords[, c("UMAP_1", "UMAP_2")]
+df$score <- seu@meta.data[[paste0(bh4_full, "_UCellMedianMaxRank")]]
+
+# Create the single UMAP plot
+p_umap_ucellMMR <- ggplot(df, aes(UMAP_1, UMAP_2, color = score)) +
+  geom_point(size = 0.2, stroke = 0, shape = 16) +
+  scale_color_gradient(low = "grey90", high = "#CB181D", name = "Score", limits = c(0, 0.8), n.breaks = 3) +
+  labs(
+    title = sprintf("BH4 UCell score (maxRank = %d)", ucell_maxrank_custom),
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ) +
+  figure_theme +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    aspect.ratio = 1
+  ) +
+  coord_fixed()
+
+# Save the figure with 2x2 dimensions
+save_fig(p_umap_ucellMMR, "5d_UMAP_BH4_score", 2, 2)
+```
+### Extended 6a UMAP by BH4 gene expression
+
+**Known Gap** (carried over verbatim from the source script, see Methods.md):
+`p1` below is never defined in this notebook -- the source script's Data1
+section references it but only ever defines a same-named local variable
+inside its (unrelated) Data7 section. This chunk will error on a fresh
+knit until `p1` is defined (most likely intended as a narrow UMAP-by-
+`cell_state` reference panel, given the `rel_widths = c(1.5, 6)` layout).
+
+```{r}
+data_mat       <- GetAssayData(seu, assay = "RNA", layer = "data")
+bh4_lognorm    <- as.matrix(t(data_mat[bh4_genes_mouse, ]))
+colnames(bh4_lognorm) <- bh4_genes_mouse
+
+### BH4 genes
+for (g in bh4_genes_mouse) df[[g]] <- bh4_lognorm[, g]
+umap_long <- df %>%
+  pivot_longer(cols = all_of(bh4_genes_mouse), names_to = "gene", values_to = "expression") %>%
+  mutate(gene = factor(gene, levels = bh4_genes_mouse, labels = bh4_genes_mouse))
+p3 <- ggplot(umap_long, aes(UMAP_1, UMAP_2, color = expression)) +
+  geom_point(size = 0.2, stroke = 0, shape = 16) +
+  facet_wrap(~ gene, nrow = 1) +
+  scale_color_gradient(low = "grey90", high = "#CB181D", name = "Expr.") +
+  labs(title = "BH4 gene expression (log-normalized)", x = "UMAP 1", y = "UMAP 2") +
+  figure_theme +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        strip.text = element_text(size = 5, face = "bold"), strip.background = element_blank(),
+        aspect.ratio = 1) +
+  coord_fixed()
+
+p_combined <- plot_grid(p1, p3, rel_widths = c(1.5, 6))
+save_fig(p_combined, "Extended_6a_UMAP_byCellState_GeneExpression", 10, 1.5)
+```
+### Main 5e boxplot by BH4 score
+
+```{r}
+box_long_scores <- do.call(rbind, lapply(bh4_score_names, function(s) {
+    data.frame(
+        Quantity = s,
+        cancer_state = seu$cell_state,
+        value = as.numeric(seu@meta.data[[paste0(s, "_UCellMedianMaxRank")]]),
+        y_label = "Signature score",
+        stringsAsFactors = FALSE
+    )
+})) %>% subset(cancer_state != "Other")
+
+title_str_scores <- sprintf("BH4 signatures by cell state  |  UCell (maxRank = %d)", ucell_maxrank_custom)
+out_file_scores  <- file.path(current.outputfolder, "5e_Boxplot_byCellState_BH4_score.pdf")
+
+make_boxplot_state(
+    box_long_scores,
+    bh4_score_names,
+    title_str_scores,
+    out_file_scores,
+    levels = STATE_ORDER[1:3],
+    fills = state_color[1:3]
+)
+```
+
+### Extended 6b6c boxplot by BH4 gene expression
+
+```{r}
+box_long_genes <- do.call(rbind, lapply(bh4_genes_mouse, function(g) {
+    data.frame(
+        Quantity = g,
+        cancer_state = seu$cell_state,
+        value = as.numeric(data_mat[g, ]),
+        y_label = "Log-normalized expression",
+        stringsAsFactors = FALSE
+    )
+})) %>% subset(cancer_state != "Other")
+
+title_str_genes <- "BH4 genes by cell state"
+out_file_genes  <- file.path(current.outputfolder, "Extended_6c_Boxplot_byCellState_GeneExpression.pdf")
+
+make_boxplot_state(
+    box_long_genes,
+    bh4_genes_mouse,
+    title_str_genes,
+    out_file_genes,
+    levels = STATE_ORDER[1:3],
+    fills = state_color[1:3]
+)
+```
+
+## write session info
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "PDAC_mouse_BH4_scoring_sessionInfo.txt")
+```

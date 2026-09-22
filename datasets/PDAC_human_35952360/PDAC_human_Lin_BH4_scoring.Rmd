@@ -1,0 +1,159 @@
+---
+title: "Whitney Henry - scRNAseq Analysis - PDAC human (Lin 2020, PMID 35952360) - BH4 Pathway Scoring Figures"
+author: "Evelyn Tong"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+  html_notebook: default
+date: "9/22/2026"
+---
+
+Split out of the original monolithic `tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`
+("BH4 analysis script - Evelyn - 2026/09/16", Data3 section) during the
+`datasets/` reorg, into its own self-contained dataset directory/project.
+See `PDAC_human_Lin_BH4_scoring_Methods.md` for the full methodology and a
+Known Gaps note (the source script's state-signature file reference was
+corrected during the reorg -- see below).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 6, fig.height = 4, dpi = 300
+)
+source("emt_code/bh4_pathway_shared_setup.R")
+```
+
+## parameter settings
+```{r}
+# figures/ + stats output for this dataset
+current.outputfolder <- "figures"
+# define where the input RDS file is
+data.path <- "Lin2020_Pancreas_malignant.rds"
+# define state categories and colors
+STATE_ORDER <- c("Classical", "IC", "Basal")
+state_color <- c("Classical"     = "#334589",
+                 "IC" = "#148241",
+                 "Basal"       = "#ed9d2d")
+```
+
+## load data and processing
+
+```{r}
+seu <- readRDS(data.path)
+cat("  Dimensions:", dim(seu)[1], "genes x", dim(seu)[2], "cells\n")
+cat("  BH4 genes present:", sum(bh4_genes %in% rownames(seu)), "/", length(bh4_genes), "\n")
+
+seu <- NormalizeData(seu)
+
+# ── Dataset-customized UCell maxRank ─────────────────────────────────────────
+# Malignant compartment = cells used for plotting/correlation (non-"Other").
+if (!"nFeature_RNA" %in% colnames(seu@meta.data)) {
+  seu$nFeature_RNA <- Matrix::colSums(GetAssayData(seu, assay = "RNA", layer = "counts") > 0)
+}
+ucell_maxrank_custom <- as.integer(round(median(seu$nFeature_RNA)))
+
+cat(sprintf(
+  "\n  >>> Custom UCell maxRank = median nFeature_RNA of malignant compartment\n"))
+cat(sprintf(
+  "      median nFeature_RNA (chosen maxRank)   : %d\n", ucell_maxrank_custom))
+```
+
+## define state based on raghavan signature
+
+**Known Gap fix**: the source script read `state_signatures.xlsx`, a file
+that doesn't exist anywhere in the exported analysis bundle. Data2
+(`PDAC_human_park_BH4_scoring.Rmd`) runs this identical classification
+rule against `34890551_Raghavan_state_signatures.xlsx`, so this notebook
+now reads that same file (copied into this dataset directory) instead --
+see Methods.md for the reasoning.
+
+```{r}
+ic_threshold = 0.2
+sc.signatures <- readxl::read_excel("34890551_Raghavan_state_signatures.xlsx")
+sig_list <- list(
+  scBasal     = na.omit(sc.signatures$scBasal[sc.signatures$scBasal != ""]),
+  scClassical = na.omit(sc.signatures$scClassical[sc.signatures$scClassical != ""]),
+  IC          = na.omit(sc.signatures$IC[sc.signatures$IC != ""])
+)
+for (nm in names(sig_list)) {
+  seu <- AddModuleScore(
+    seu,
+    features = list(sig_list[[nm]]),
+    name = nm,
+    search = FALSE
+  )
+  colnames(seu@meta.data)[colnames(seu@meta.data) == paste0(nm, "1")] <- paste0(nm, "_AMS")
+}
+
+# 4. Classify sc-set state (Raghavan 2021 rule) using the AMS scores
+clas <- seu@meta.data[["scClassical_AMS"]]
+bas  <- seu@meta.data[["scBasal_AMS"]]
+ic   <- seu@meta.data[["IC_AMS"]]
+
+tt_cb    <- clas - bas          # Classical - Basal
+ic_score <- ic - abs(tt_cb)     # IC_Score per the original paper
+
+seu$cell_state <- dplyr::case_when(
+  ic_score >= ic_threshold                 ~ "IC",
+  ic_score <  ic_threshold & tt_cb > 0     ~ "Classical",
+  ic_score <  ic_threshold & tt_cb < 0     ~ "Basal",
+  TRUE                                     ~ "undefined"
+)
+seu$cell_state <- factor(as.character(seu@meta.data$cell_state), levels = STATE_ORDER)
+cat("  State counts:\n"); print(table(seu$cell_state, useNA = "ifany"))
+```
+
+## calculate BH4 signature score
+
+```{r}
+# Run UCell, maxRank = dataset-customized maxRank (median nFeature of malignant)
+seu <- AddModuleScore_UCell(
+  seu,
+  features = bh4_sigs,
+  maxRank = ucell_maxrank_custom,
+  name = "_UCellMedianMaxRank",
+  ncores = 4
+)
+
+# Composite (full-pathway) scores for the summary / UMAP / heatmap
+seu$BH4_UCellMedianMaxRank <- seu@meta.data[[paste0(bh4_full, "_UCellMedianMaxRank")]]
+```
+
+## plotting
+
+### Extended 6d boxplot by BH4 score (primary only)
+```{r}
+# Define the new column 'is_met' with "yes" or "no"
+seu$is_met <- ifelse(grepl("^MET", as.character(seu$sample)), "yes", "no")
+# 1. Build the long-format dataframe for plotting (signatures only)
+box_long <- do.call(rbind, lapply(bh4_score_names, function(s) {
+  data.frame(
+    Quantity = s,
+    cancer_state = seu$cell_state,
+    is_met = seu$is_met,
+    value = as.numeric(seu@meta.data[[paste0(s, "_UCellMedianMaxRank")]]),
+    y_label = "Signature score",
+    stringsAsFactors = FALSE
+  )
+})) %>% subset(is_met != "yes")
+
+# 2. Generate and save the boxplot using your custom function
+title_str <- sprintf("BH4 signatures by cell state (primary only) | UCell (maxRank = %d)", ucell_maxrank_custom)
+out_file  <- file.path(current.outputfolder, "Extended_6d_Boxplot_byCellState_BH4_score.pdf")
+
+make_boxplot_state(
+  box_long,
+  bh4_score_names,
+  title_str,
+  out_file,
+  levels = STATE_ORDER[1:3],
+  fills = state_color[1:3]
+)
+```
+
+## write session info
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "PDAC_human_Lin_BH4_scoring_sessionInfo.txt")
+```
