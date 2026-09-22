@@ -137,7 +137,7 @@ before either script is shared outside the lab or published to Zenodo.
 | BRCA_atlas_CellxGene_Chen | Fig5b, ExtData5a–d | `Fig5b_ssgsea_BH4_Chen.svg`, `ExtData5a_ssgsea_Glutathione_Chen.svg`, `ExtData5b_ssgsea_CoQ10_Chen.svg`, `ExtData5c_ssgsea_Thioredoxin_Chen.svg`, `ExtData5d_ssgsea_Peroxiredoxin_Chen.svg` |
 | BRCA_TCGA | Fig5c | `Fig5c_ssgsea_BH4_TCGA_BRCA.svg` |
 | TNBC_cellline_SUM149PT_GSE172609 | ExtData5e, ExtData5f | `ExtData5e_bh4_boxplot_by_emtstate_dunnett.svg`, `ExtData5f_heatmap_bh4genes_lfc_sig.svg` |
-| PDAC_mouse_35952360 | Fig5d, Fig5e, ExtData6a, ExtData6c | `5d_UMAP_BH4_score.pdf/.svg`, `5e_Boxplot_byCellState_BH4_score.pdf/.svg`, `Extended_6a_UMAP_byCellState_GeneExpression.pdf/.svg` (blocked -- see Known Gaps), `Extended_6c_Boxplot_byCellState_GeneExpression.pdf/.svg` |
+| PDAC_mouse_35952360 | Fig5d, Fig5e, ExtData6a, ExtData6c | `5d_UMAP_BH4_score.pdf/.svg`, `5e_Boxplot_byCellState_BH4_score.pdf/.svg`, `Extended_6a_UMAP_byCellState_GeneExpression.pdf/.svg`, `Extended_6c_Boxplot_byCellState_GeneExpression.pdf/.svg` |
 | PDAC_human_38702773 | Fig5f | `5f_Boxplot_byCellState_BH4_score.pdf/.svg` |
 | PDAC_human_35952360 | ExtData6d | `Extended_6d_Boxplot_byCellState_BH4_score.pdf/.svg` |
 | SKCM_TCGA | Fig5g | `5g_Boxplot_byCellState_BH4_score.pdf/.svg` |
@@ -254,14 +254,13 @@ to get them:
   a single monolithic script on 2026-09-22 (each into its own combined
   scoring/plotting notebook, same rationale as SUM149PT above -- every
   input `.rds` was already a prepared checkpoint, not raw data needing
-  its own prep stage). All of them have PDF figures already on disk from
-  the original combined-script run, but **none have been re-knit as
-  their new, split-out notebook** -- their `*_sessionInfo.txt` files are
-  placeholders, not real output, since no R/container access was
-  available during the split. Before relying on these for the paper:
-  open each `.Rproj` in the container and re-knit top-to-bottom to
-  confirm the split didn't introduce a regression, and to generate the
-  paired `.svg` alongside the existing `.pdf`. See "Known gaps" for two
+  its own prep stage). 6 of the 7 have since been re-knit end to end in
+  the container and have real `*_sessionInfo.txt` output confirming the
+  split works. **`PDAC_mouse_35952360` is the exception** -- it was
+  blocked by the Extended 6a `p1` bug (now fixed, see "Known gaps"
+  below) and still has a placeholder `sessionInfo.txt`; re-knit it once
+  more to confirm the fix and generate real session info. See "Known
+  gaps" for two
   correctness issues found in the source script during the split.
 
 ## Known gaps
@@ -296,22 +295,24 @@ fix was made.
   directory's *contents* (`datasets/*/data/*`) instead of the directory
   itself, which lets the negation apply; `rename.sh` is now genuinely
   tracked.
-- **PDAC_mouse_35952360's Extended 6a panel references an undefined
+- **PDAC_mouse_35952360's Extended 6a panel referenced an undefined
   `p1`.** The source script's Data1 section called
   `plot_grid(p1, p3, rel_widths = c(1.5, 6))`, but `p1` was never defined
-  anywhere in that section -- the only `p1` in the whole source script is
-  an unrelated local variable in the (later-running) cell-line Data7
-  section. Per the repo owner's decision, this was carried over verbatim
-  (not silently patched) -- see that dataset's Methods.md. Will error on
-  a fresh knit until `p1` is defined.
+  anywhere in that section. Initially carried over verbatim (not
+  silently patched) rather than guessed at. **Resolved:** the author
+  (Evelyn) confirmed by email this was an accidental deletion and
+  supplied the original definition -- a narrow UMAP colored by
+  `cell_state` -- now restored in the notebook; see that dataset's
+  Methods.md.
 - **PDAC_human_35952360 (Lin) read a nonexistent
   `state_signatures.xlsx`.** No such file exists anywhere in the source
   script's exported bundle. Since Data2 (Park, `PDAC_human_38702773`)
   runs the identical Raghavan-rule classification code against
   `34890551_Raghavan_state_signatures.xlsx`, and both datasets share the
   same `ic_threshold`/signature columns, this was repointed at that same
-  file per the repo owner's confirmation -- see that dataset's
-  Methods.md.
+  file during the reorg. **Resolved:** the author has since confirmed by
+  email that `34890551_Raghavan_state_signatures.xlsx` is indeed the
+  correct file -- see that dataset's Methods.md.
 - **`sessionInfo.txt` placeholders for all 7 newly split datasets.** No
   R/Singularity/Apptainer was available in the environment that
   performed the split, so none of the 7 new notebooks have actually been

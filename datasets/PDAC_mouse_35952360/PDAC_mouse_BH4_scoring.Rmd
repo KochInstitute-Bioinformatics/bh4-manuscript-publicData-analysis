@@ -12,9 +12,9 @@ date: "9/22/2026"
 Split out of the original monolithic `tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`
 ("BH4 analysis script - Evelyn - 2026/09/16", Data1 section) during the
 `datasets/` reorg, into its own self-contained dataset directory/project.
-See `PDAC_mouse_BH4_scoring_Methods.md` for the full methodology and a
-Known Gaps note (a pre-existing bug in the Extended 6a panel, carried over
-verbatim from the source script).
+See `PDAC_mouse_BH4_scoring_Methods.md` for the full methodology, including
+a resolved Known Gaps note on the Extended 6a panel's `p1` (an accidental
+deletion in the source script, restored per the author's confirmation).
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
@@ -110,19 +110,29 @@ save_fig(p_umap_ucellMMR, "5d_UMAP_BH4_score", 2, 2)
 ```
 ### Extended 6a UMAP by BH4 gene expression
 
-**Known Gap** (carried over verbatim from the source script, see Methods.md):
-`p1` below is never defined in this notebook -- the source script's Data1
-section references it but only ever defines a same-named local variable
-inside its (unrelated) Data7 section. This chunk will error on a fresh
-knit until `p1` is defined (most likely intended as a narrow UMAP-by-
-`cell_state` reference panel, given the `rel_widths = c(1.5, 6)` layout).
+`p1` (a narrow UMAP colored by `cell_state`, paired with `p3`'s wider
+per-gene expression panel below) was missing from the source script --
+the author confirmed this was accidentally deleted and supplied the
+original definition, restored verbatim here. See Methods.md.
 
 ```{r}
+### UMAP by cell state
+df_umap <- umap_coords[order(umap_coords$cell_state == "Other", decreasing = TRUE), ]
+p1 <- ggplot(df_umap, aes(UMAP_1, UMAP_2, color = cell_state)) +
+  geom_point(size = 0.2, stroke = 0, shape = 16) +
+  scale_color_manual(values = state_color, name = "Cell state", drop = FALSE) +
+  labs(title = "Autochthonous KPCT cells", subtitle = paste0(nrow(df_umap), " cells"),
+       x = "UMAP 1", y = "UMAP 2") +
+  figure_theme +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(), aspect.ratio = 1) +
+  guides(color = guide_legend(override.aes = list(size = 1.2))) +
+  coord_fixed()
+
+### BH4 genes
 data_mat       <- GetAssayData(seu, assay = "RNA", layer = "data")
 bh4_lognorm    <- as.matrix(t(data_mat[bh4_genes_mouse, ]))
 colnames(bh4_lognorm) <- bh4_genes_mouse
 
-### BH4 genes
 for (g in bh4_genes_mouse) df[[g]] <- bh4_lognorm[, g]
 umap_long <- df %>%
   pivot_longer(cols = all_of(bh4_genes_mouse), names_to = "gene", values_to = "expression") %>%

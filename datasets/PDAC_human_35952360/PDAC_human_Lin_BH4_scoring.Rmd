@@ -13,8 +13,9 @@ Split out of the original monolithic `tmp/WH_BH4pathway_final/src/Analysis_scrip
 ("BH4 analysis script - Evelyn - 2026/09/16", Data3 section) during the
 `datasets/` reorg, into its own self-contained dataset directory/project.
 See `PDAC_human_Lin_BH4_scoring_Methods.md` for the full methodology and a
-Known Gaps note (the source script's state-signature file reference was
-corrected during the reorg -- see below).
+resolved Known Gaps note (the source script's state-signature file
+reference, corrected during the reorg and since confirmed correct by the
+author -- see below).
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
@@ -61,12 +62,13 @@ cat(sprintf(
 
 ## define state based on raghavan signature
 
-**Known Gap fix**: the source script read `state_signatures.xlsx`, a file
-that doesn't exist anywhere in the exported analysis bundle. Data2
-(`PDAC_human_park_BH4_scoring.Rmd`) runs this identical classification
-rule against `34890551_Raghavan_state_signatures.xlsx`, so this notebook
-now reads that same file (copied into this dataset directory) instead --
-see Methods.md for the reasoning.
+**Known Gap fix (author-confirmed)**: the source script read
+`state_signatures.xlsx`, a file that doesn't exist anywhere in the
+exported analysis bundle. This was repointed at
+`34890551_Raghavan_state_signatures.xlsx` (the file Data2,
+`PDAC_human_park_BH4_scoring.Rmd`, uses for the identical classification
+rule) during the reorg, and the author has since confirmed by email that
+this is the correct file -- see Methods.md.
 
 ```{r}
 ic_threshold = 0.2

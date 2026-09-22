@@ -17,7 +17,7 @@ else `Classical` if `Classical > Basal`, else `Basal`. Samples flagged
 `is_met = "yes"` (metastatic, `sample` starting with `MET`) are excluded
 from the Extended 6d boxplot -- primary tumor only.
 
-## Known Gaps (resolved during the `datasets/` reorg)
+## Known Gaps (resolved -- author-confirmed fix)
 
 The source script
 (`tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`, Data3 section) read
@@ -26,13 +26,13 @@ does not exist anywhere in the exported analysis bundle. Data2
 (`PDAC_human_park_BH4_scoring.Rmd`, Park et al.) runs this identical
 classification code against `34890551_Raghavan_state_signatures.xlsx`,
 and since both datasets use the same Raghavan 2021 rule with the same
-`ic_threshold = 0.2` and the same 3 signature columns, this was most
-likely a copy-paste filename shortening rather than a genuinely different
-file. This notebook was updated to read
+`ic_threshold = 0.2` and the same 3 signature columns, this was inferred
+to be a copy-paste filename shortening rather than a genuinely different
+file, and this notebook was repointed at
 `34890551_Raghavan_state_signatures.xlsx` (copied into this directory)
-instead, per the repo owner's confirmation -- if this assumption turns
-out to be wrong, the original (missing) `state_signatures.xlsx` reference
-is preserved in git history (see the `reorg` branch's parent commit).
+during the reorg. The author (Evelyn) has since confirmed by email that
+`34890551_Raghavan_state_signatures.xlsx` is indeed the correct file --
+the filename in the source script was simply wrong.
 
 ## BH4 signature scoring
 

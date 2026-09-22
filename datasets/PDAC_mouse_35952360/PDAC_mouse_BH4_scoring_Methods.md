@@ -26,25 +26,25 @@ run a Kruskal-Wallis test across cell states, and where significant
 (p < 0.05), pairwise Wilcoxon tests with Benjamini-Hochberg correction;
 only comparisons with adjusted p < 0.05 are bracket-annotated.
 
-## Known Gaps
+## Known Gaps (resolved -- author-confirmed fix)
 
-- **Extended 6a's `p1` is undefined.** The source script
-  (`tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`, Data1 section)
-  calls `plot_grid(p1, p3, rel_widths = c(1.5, 6))` but never defines
-  `p1` anywhere in this dataset's code path -- the only `p1` in the whole
-  source script is a same-named local variable inside the unrelated
-  Data7 (cell-line) section. This was carried over verbatim (not
-  silently patched) during the `datasets/` reorg, per the repo owner's
-  decision -- fix by defining `p1` (most likely a narrow UMAP colored by
-  `cell_state`, matching the panel's own filename and the 1.5:6 width
-  ratio) before re-knitting.
+Extended 6a's `p1` was undefined when this notebook was first split out
+of the source script (`tmp/WH_BH4pathway_final/src/Analysis_script.Rmd`,
+Data1 section) -- `plot_grid(p1, p3, rel_widths = c(1.5, 6))` referenced
+`p1`, but it was never defined anywhere in this dataset's code path.
+Author (Evelyn) confirmed by email this was an accidental deletion and
+supplied the original definition -- a narrow UMAP colored by
+`cell_state` (`scale_color_manual(values = state_color, ...)`, Other
+cells drawn first/behind via `order(cell_state == "Other", decreasing =
+TRUE)`), titled "Autochthonous KPCT cells". Restored verbatim; see the
+notebook's Extended 6a chunk.
 
 ## Saved figures
 
 | Figure | File(s) in `figures/` |
 | --- | --- |
 | Fig5d | `5d_UMAP_BH4_score.pdf`/`.svg` |
-| ExtData6a | `Extended_6a_UMAP_byCellState_GeneExpression.pdf`/`.svg` (blocked by the Known Gap above) |
+| ExtData6a | `Extended_6a_UMAP_byCellState_GeneExpression.pdf`/`.svg` |
 | Fig5e | `5e_Boxplot_byCellState_BH4_score.pdf`/`.svg` |
 | ExtData6c | `Extended_6c_Boxplot_byCellState_GeneExpression.pdf`/`.svg` |
 
