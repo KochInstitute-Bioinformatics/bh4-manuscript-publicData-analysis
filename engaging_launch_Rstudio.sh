@@ -1,14 +1,13 @@
 #!/bin/bash
 
-#SBATCH --job-name=Rstudio       # Assign an short name to your job
+#SBATCH -n 1
+#SBATCH --job-name=Rstudio           # Assign an short name to your job
 #SBATCH --output=slurm.%N.%j.out     # STDOUT output file
-#SBATCH -p ou_ki
+#SBATCH --mail-user=example@mit.edu  # The user to email
+#SBATCH --mail-type=ALL
 
-#module load deprecated-modules
-#module load apptainer/1.1.7-x86_64
-#module load squashfuse/0.1.104-x86_64
-module load apptainer/1.1.9
-module load miniforge/23.11.0-0
+module load apptainer
+module load miniforge
 
 workdir=$(python -c 'import tempfile; print(tempfile.mkdtemp())')
 echo "workdir: " $workdir
