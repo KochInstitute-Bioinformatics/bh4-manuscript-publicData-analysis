@@ -1,0 +1,33 @@
+==============================================================================
+ RStudio Server   job 24010942   node node1608   port 42241
+ image : /orcd/data/ki/003/core/bcc/DSMI_Resources/containers/r453_sc_bulk_rnaseq_20260926.sif
+ cores : 8      mem: 65536 MB
+==============================================================================
+
+OPTION A -- VS Code Remote
+  Ports panel > Forward a Port > enter:   node1608:42241
+  Then open:  http://localhost:42241
+
+OPTION B -- SSH tunnel from your laptop (one hop; try this first)
+  ssh -N -L 42241:node1608:42241 charliew@orcd-login.mit.edu
+  Then open:  http://localhost:42241
+
+OPTION C -- two-hop tunnel (if the login node cannot route to node1608)
+  ssh -t -L 42241:localhost:42241 charliew@orcd-login.mit.edu \
+      ssh -t node1608 -L 42241:localhost:42241
+  Then open:  http://localhost:42241
+
+LOGIN
+  user:     charliew
+  password: koch76
+
+NOTES
+  * Container HOME (persistent R library / prefs): /orcd/data/ki/003/core/bcc/projects/wshenry-Henry/BH4_paper/bh4-manuscript-publicData-analysis
+  * Project data is visible at its real /orcd/... paths.
+  * Job scratch (auto-deleted on exit): /orcd/data/ki/003/core/bcc/DSMI_Resources/tmp/charliew/rstudio-24010942.kgZCqB
+  * Image provenance: see /orcd/data/ki/003/core/bcc/DSMI_Resources/containers/r453_sc_bulk_rnaseq_20260926.sif.provenance.txt
+
+WHEN FINISHED
+  1. In RStudio click the power button (top right) to quit the session.
+  2. On a login node:   scancel -f 24010942
+==============================================================================

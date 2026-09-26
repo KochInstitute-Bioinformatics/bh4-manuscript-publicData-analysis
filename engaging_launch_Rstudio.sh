@@ -42,10 +42,15 @@ set -uo pipefail
 DSMI=${DSMI:-/orcd/data/ki/003/core/bcc/DSMI_Resources}
 
 # Shared read-only container image (managed by the BCC; do not modify)
-RSTUDIO_SIF=${RSTUDIO_SIF:-$DSMI/containers/bulk_r451_v1.sif}
+RSTUDIO_SIF=${RSTUDIO_SIF:-$DSMI/containers/r453_sc_bulk_rnaseq_20260926.sif}
 
-# Persistent container HOME: R library, .Rprofile, RStudio prefs. Per-user.
-RSTUDIO_HOME=${RSTUDIO_HOME:-$DSMI/rstudio_home/$USER}
+# Container HOME = submission directory (the repo clone). Project files, .Rprofile
+# and .Rproj settings are then visible to RStudio as ~.
+RSTUDIO_HOME=${RSTUDIO_HOME:-${SLURM_SUBMIT_DIR:-$PWD}}
+
+# Per-user R library, pinned to this image's R version, shared across projects.
+# Set to "none" for a repo-local library under $RSTUDIO_HOME/R.
+R_LIBS_SHARED=${R_LIBS_SHARED:-$DSMI/rlibs_r453/$(id -un)}
 
 # Per-job scratch (/run, /tmp, rserver sqlite DB). Real disk, not tmpfs.
 SCRATCH_BASE=${SCRATCH_BASE:-$DSMI/tmp/$USER}
@@ -137,7 +142,8 @@ export APPTAINER_TMPDIR="${workdir}/tmp"
 
 export APPTAINERENV_RSTUDIO_SESSION_TIMEOUT=0
 export APPTAINERENV_USER=$(id -un)
-export APPTAINERENV_PASSWORD=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)
+export APPTAINERENV_PASSWORD="koch76"
+#export APPTAINERENV_PASSWORD=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)
 
 PORT=$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
 readonly PORT
