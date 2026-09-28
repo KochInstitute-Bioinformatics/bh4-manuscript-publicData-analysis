@@ -126,8 +126,6 @@ binds+=",${workdir}/tmp:/tmp"
 binds+=",${workdir}/database.conf:/etc/rstudio/database.conf"
 binds+=",${workdir}/rsession.sh:/etc/rstudio/rsession.sh"
 binds+=",${workdir}/var/lib/rstudio-server:/var/lib/rstudio-server"
-# Whole ORCD tree at real paths so project data resolves as it does on the host
-binds+=",/orcd:/orcd"
 # Convenience aliases used by scripts in this repo
 binds+=",/orcd/data/ki/003/core/bcc/IGB_Resources/annotation_files:/annotationFiles"
 binds+=",/orcd/data/ki/003/core/bcc/IGB_Resources/scripts:/scripts"
