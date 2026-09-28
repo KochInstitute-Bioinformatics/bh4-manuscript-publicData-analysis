@@ -182,7 +182,7 @@ NOTES
 
 WHEN FINISHED
   1. In RStudio click the power button (top right) to quit the session.
-  2. On a login node:   scancel -f ${SLURM_JOB_ID}
+  2. The script will calculate provenance information about the container used, print it to a file, then exit.
 ==============================================================================
 INFOEOF
 
