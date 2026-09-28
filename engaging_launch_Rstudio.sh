@@ -64,7 +64,7 @@ module load miniforge          # python used for the free-port pick
 
 # --- preflight: the image must already exist ---------------------------------
 if [[ ! -r "$RSTUDIO_SIF" ]]; then
-  cat 1>&2 <<ERR
+  cat 1>&2 <<EOF
 
 ======================================================================
 ERROR: cannot read the analysis container image
@@ -85,7 +85,7 @@ Most common cause: your account is not in the BCC storage group
 (orcd_rg_hstor003_pg_ki_bcc), so you cannot traverse to the image.
 ======================================================================
 
-ERR
+EOF
   exit 1
 fi
 
@@ -189,17 +189,6 @@ INFOEOF
 chmod 600 "$INFO"
 cat "$INFO" 1>&2
 
-# --- record what we ran, for reproducibility ---------------------------------
-{
-  echo "--- provenance ---"
-  echo "sif        : $RSTUDIO_SIF"
-  echo "sif mtime  : $(stat -c %y "$RSTUDIO_SIF" 2>/dev/null)"
-  echo "sif sha256 : $(sha256sum "$RSTUDIO_SIF" 2>/dev/null | cut -d' ' -f1)"
-  echo "apptainer  : $(apptainer --version)"
-  echo "node       : $NODE"
-  echo "git commit : $(git -C "$SLURM_SUBMIT_DIR" rev-parse --short HEAD 2>/dev/null || echo 'n/a')"
-} 1>&2
-
 # --- launch -------------------------------------------------------------------
 apptainer exec --cleanenv \
   -H "${RSTUDIO_HOME}:/home/rstudio" \
@@ -212,6 +201,17 @@ apptainer exec --cleanenv \
     --auth-stay-signed-in-days=30 \
     --auth-timeout-minutes=0 \
     --rsession-path=/etc/rstudio/rsession.sh
+
+# --- record what we ran, for reproducibility ---------------------------------
+{
+  echo "--- provenance ---"
+  echo "sif        : $RSTUDIO_SIF"
+  echo "sif mtime  : $(stat -c %y "$RSTUDIO_SIF" 2>/dev/null)"
+  echo "sif sha256 : $(sha256sum "$RSTUDIO_SIF" 2>/dev/null | cut -d' ' -f1)"
+  echo "apptainer  : $(apptainer --version)"
+  echo "node       : $NODE"
+  echo "git commit : $(git -C "$SLURM_SUBMIT_DIR" rev-parse --short HEAD 2>/dev/null || echo 'n/a')"
+} 1>&2
 
 rc=$?
 printf 'rserver exited with status %d\n' "$rc" 1>&2
