@@ -68,3 +68,8 @@ slurm.*.err
 # --- OS/editor cruft ---
 .DS_Store
 Thumbs.db
+
+# --- RStudio Server session artifacts from singularity_Rstudio_451.sh ---
+# Per-session scratch (connect info + SLURM stdout), never tracked.
+rstudio-*
+rstudio.*
