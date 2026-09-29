@@ -182,7 +182,9 @@ NOTES
 
 WHEN FINISHED
   1. In RStudio click the power button (top right) to quit the session.
-  2. The script will calculate provenance information about the container used, print it to a file, then exit.
+  2. Issue the following command on the login node:
+      scancel -f ${SLURM_JOB_ID}
+  3. The script will calculate provenance information about the container used, print it to a file, then exit.
 ==============================================================================
 INFOEOF
 
@@ -207,7 +209,7 @@ apptainer exec --cleanenv \
   echo "--- provenance ---"
   echo "sif        : $RSTUDIO_SIF"
   echo "sif mtime  : $(stat -c %y "$RSTUDIO_SIF" 2>/dev/null)"
-  echo "sif sha256 : $(sha256sum "$RSTUDIO_SIF" 2>/dev/null | cut -d' ' -f1)"
+  #echo "sif sha256 : $(sha256sum "$RSTUDIO_SIF" 2>/dev/null | cut -d' ' -f1)"
   echo "apptainer  : $(apptainer --version)"
   echo "node       : $NODE"
   echo "git commit : $(git -C "$SLURM_SUBMIT_DIR" rev-parse --short HEAD 2>/dev/null || echo 'n/a')"
