@@ -71,5 +71,7 @@ Thumbs.db
 
 # --- RStudio Server session artifacts from singularity_Rstudio_451.sh ---
 # Per-session scratch (connect info + SLURM stdout), never tracked.
-rstudio-*
-rstudio.*
+rstudio*
+
+# vscode workspace file
+090826_BH4_paper.code-workspace

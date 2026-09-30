@@ -36,24 +36,20 @@
 set -uo pipefail
 
 # ===========================================================================
-# CONFIG -- override by exporting before sbatch, e.g.
-#   RSTUDIO_SIF=/path/to/alt.sif sbatch engaging_launch_Rstudio.sh
+# CONFIG -- shared files in DSMI are read-only; job-created files go in the
+# directory where the job was submitted.
 # ===========================================================================
 DSMI=${DSMI:-/orcd/data/ki/003/core/bcc/DSMI_Resources}
 
 # Shared read-only container image (managed by the BCC; do not modify)
 RSTUDIO_SIF=${RSTUDIO_SIF:-$DSMI/containers/r453_sc_bulk_rnaseq_20260926.sif}
 
-# Container HOME = submission directory (the repo clone). Project files, .Rprofile
-# and .Rproj settings are then visible to RStudio as ~.
-RSTUDIO_HOME=${RSTUDIO_HOME:-${SLURM_SUBMIT_DIR:-$PWD}}
+# Slurm's submission directory; fall back to the current directory.
+SUBMIT_DIR=${SLURM_SUBMIT_DIR:-$PWD}
 
-# Per-user R library, pinned to this image's R version, shared across projects.
-# Set to "none" for a repo-local library under $RSTUDIO_HOME/R.
-R_LIBS_SHARED=${R_LIBS_SHARED:-$DSMI/rlibs_r453/$(id -un)}
-
-# Per-job scratch (/run, /tmp, rserver sqlite DB). Real disk, not tmpfs.
-SCRATCH_BASE=${SCRATCH_BASE:-$DSMI/tmp/$USER}
+# RStudio home and per-job scratch are both in the submission directory.
+RSTUDIO_HOME=$SUBMIT_DIR
+SCRATCH_BASE=$SUBMIT_DIR
 
 # Login node used in the printed tunnel instructions
 LOGIN_NODE=${LOGIN_NODE:-orcd-login.mit.edu}
@@ -127,10 +123,10 @@ binds+=",${workdir}/database.conf:/etc/rstudio/database.conf"
 binds+=",${workdir}/rsession.sh:/etc/rstudio/rsession.sh"
 binds+=",${workdir}/var/lib/rstudio-server:/var/lib/rstudio-server"
 # Convenience aliases used by scripts in this repo
-binds+=",/orcd/data/ki/003/core/bcc/IGB_Resources/annotation_files:/annotationFiles"
-binds+=",/orcd/data/ki/003/core/bcc/IGB_Resources/scripts:/scripts"
-binds+=",/orcd/data/ki/003/core/bcc/Genomes:/Genomes"
-binds+=",${DSMI}:/DSMI_Resources"
+binds+=",/orcd/data/ki/003/core/bcc/IGB_Resources/annotation_files:/annotationFiles:ro"
+binds+=",/orcd/data/ki/003/core/bcc/IGB_Resources/scripts:/scripts:ro"
+binds+=",/orcd/data/ki/003/core/bcc/Genomes:/Genomes:ro"
+binds+=",${DSMI}:/DSMI_Resources:ro"
 export APPTAINER_BIND="$binds"
 
 # --- apptainer / session environment ----------------------------------------
@@ -148,7 +144,7 @@ readonly PORT
 
 # --- connection instructions --------------------------------------------------
 NODE=$(hostname -s)
-INFO="rstudio-${SLURM_JOB_ID}.connect.txt"
+INFO="${SUBMIT_DIR}/rstudio-${SLURM_JOB_ID}.connect.txt"
 
 cat > "$INFO" <<INFOEOF
 ==============================================================================
@@ -176,7 +172,6 @@ LOGIN
 
 NOTES
   * Container HOME (persistent R library / prefs): ${RSTUDIO_HOME}
-  * Project data is visible at its real /orcd/... paths.
   * Job scratch (auto-deleted on exit): ${workdir}
   * Image provenance: see ${RSTUDIO_SIF}.provenance.txt
 
